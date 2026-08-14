@@ -94,10 +94,10 @@ type ChapterResponse = {
 
 class NovelArchivePlugin implements Plugin.PluginBase {
   id = 'novelarchive';
-  name = 'NovelArchive';
+  name = 'Novel Archive';
   icon = 'src/en/novelarchive/icon.png';
   site = 'https://novelarchive.cc';
-  version = '1.1.0';
+  version = '1.1.1';
   filters = {
     sort: {
       type: FilterTypes.Picker,
