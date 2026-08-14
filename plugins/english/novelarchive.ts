@@ -97,7 +97,7 @@ class NovelArchivePlugin implements Plugin.PluginBase {
   name = 'Novel Archive';
   icon = 'src/en/novelarchive/icon.png';
   site = 'https://novelarchive.cc';
-  version = '1.1.1';
+  version = '1.1.2';
   filters = {
     sort: {
       type: FilterTypes.Picker,
@@ -358,7 +358,7 @@ class NovelArchivePlugin implements Plugin.PluginBase {
       .replace(/,\s*volume\s*\d+.*$/i, '')
       .replace(/:\s*book\s*\d+.*$/i, '')
       .replace(/\(light novel[^)]*\)/i, '')
-      .replace(/[^\p{L}\p{N}]+/gu, ' ')
+      .replace(/[^a-z0-9]+/gi, ' ')
       .replace(/\s+/g, ' ')
       .trim()
       .toLowerCase();
