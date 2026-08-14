@@ -98,7 +98,7 @@ class NovelArchivePlugin implements Plugin.PluginBase {
   name = 'Novel Archive';
   icon = 'src/en/novelarchive/icon.png';
   site = 'https://novelarchive.cc';
-  version = '1.1.8';
+  version = '1.1.9';
   pluginSettings = {
     mergeSeries: {
       label: 'Merge volume variants into one series',
@@ -242,7 +242,7 @@ class NovelArchivePlugin implements Plugin.PluginBase {
       `/api/novels?${params.toString()}`,
     );
 
-    return this.toNovelItems(response.novels);
+    return this.toNovelItems(response.novels, true);
   }
 
   resolveUrl = (path: string, isNovel?: boolean) => {
@@ -329,6 +329,7 @@ class NovelArchivePlugin implements Plugin.PluginBase {
 
   private toNovelItems(
     novels: NovelArchiveNovel[] | undefined,
+    dedupeOnly = false,
   ): Plugin.NovelItem[] {
     const items = (novels || [])
       .filter((novel): novel is NovelArchiveNovel =>
@@ -341,6 +342,19 @@ class NovelArchivePlugin implements Plugin.PluginBase {
           novel.cover_url || novel.novel_image || novel.image_url,
         ),
       }));
+
+    // The search endpoint returns overlapping IDs across pages (verified:
+    // "lotm"/"mother of learning" return the identical set on page 2), which
+    // the app's virtualized list re-renders as duplicate "ghost" rows. Drop
+    // any path already seen on this page before returning.
+    if (dedupeOnly) {
+      const seen = new Set<string>();
+      return items.filter(item => {
+        if (seen.has(item.path)) return false;
+        seen.add(item.path);
+        return true;
+      });
+    }
 
     // Merge is opt-in via the plugin setting "Merge volume variants into one
     // series". The setting is read from the host-injected `storage` (see the
