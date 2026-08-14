@@ -3,6 +3,7 @@ import type { Plugin } from '@/types/plugin';
 import { FilterTypes, type Filters } from '@libs/filterInputs';
 import { defaultCover } from '@libs/defaultCover';
 import { NovelStatus } from '@libs/novelStatus';
+import { Storage } from '@libs/storage';
 
 const GENRE_OPTIONS = [
   { label: 'Action', value: 'action' },
@@ -97,7 +98,25 @@ class NovelArchivePlugin implements Plugin.PluginBase {
   name = 'Novel Archive';
   icon = 'src/en/novelarchive/icon.png';
   site = 'https://novelarchive.cc';
-  version = '1.1.3';
+  version = '1.1.4';
+  pluginSettings = {
+    mergeSeries: {
+      label: 'Merge volume variants into one series',
+      type: 'Switch',
+      value: false,
+    },
+  };
+  private storage?: Storage;
+  constructor() {
+    try {
+      // LNReader injects @libs/storage as { storage, localStorage, sessionStorage }.
+      // Captured so we can read the user's plugin settings at browse time.
+      const s = require('@libs/storage') as { storage?: Storage } | undefined;
+      this.storage = s?.storage;
+    } catch {
+      this.storage = undefined;
+    }
+  }
   filters = {
     sort: {
       type: FilterTypes.Picker,
@@ -308,20 +327,6 @@ class NovelArchivePlugin implements Plugin.PluginBase {
     const includedGenres = this.toStringList(filters.genre.value.include);
     const excludedGenres = this.toStringList(filters.genre.value.exclude);
 
-    return (
-      (sort !== '' && sort !== 'recent') ||
-      (status !== '' && status !== 'all') ||
-      includedGenres.length > 0 ||
-      excludedGenres.length > 0
-    );
-  }
-
-  // Opt-in series merging. When false (default) the API's volume entries are
-  // passed through untouched, so browse/search always reflect what the source
-  // actually returns. Enable only if you want volume variants collapsed into one
-  // series row (best-effort, since the API has no series aggregate endpoint).
-  private mergeSeriesEnabled = false;
-
   private toNovelItems(
     novels: NovelArchiveNovel[] | undefined,
   ): Plugin.NovelItem[] {
@@ -337,7 +342,10 @@ class NovelArchivePlugin implements Plugin.PluginBase {
         ),
       }));
 
-    if (!this.mergeSeriesEnabled) {
+    // Merge is opt-in via the plugin setting "Merge volume variants into one
+    // series". When off (default) the API's volume entries pass through
+    // untouched, so browse/search reflect exactly what the source returns.
+    if (!this.storage?.get('mergeSeries')) {
       return items;
     }
 
