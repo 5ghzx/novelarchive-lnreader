@@ -327,6 +327,13 @@ class NovelArchivePlugin implements Plugin.PluginBase {
     const includedGenres = this.toStringList(filters.genre.value.include);
     const excludedGenres = this.toStringList(filters.genre.value.exclude);
 
+    return (
+      (sort !== '' && sort !== 'recent') ||
+      (status !== '' && status !== 'all') ||
+      includedGenres.length > 0 ||
+      excludedGenres.length > 0
+    );
+  }
   private toNovelItems(
     novels: NovelArchiveNovel[] | undefined,
   ): Plugin.NovelItem[] {
