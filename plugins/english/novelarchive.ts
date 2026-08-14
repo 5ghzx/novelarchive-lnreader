@@ -97,7 +97,7 @@ class NovelArchivePlugin implements Plugin.PluginBase {
   name = 'Novel Archive';
   icon = 'src/en/novelarchive/icon.png';
   site = 'https://novelarchive.cc';
-  version = '1.1.2';
+  version = '1.1.3';
   filters = {
     sort: {
       type: FilterTypes.Picker,
@@ -316,40 +316,46 @@ class NovelArchivePlugin implements Plugin.PluginBase {
     );
   }
 
+  // Opt-in series merging. When false (default) the API's volume entries are
+  // passed through untouched, so browse/search always reflect what the source
+  // actually returns. Enable only if you want volume variants collapsed into one
+  // series row (best-effort, since the API has no series aggregate endpoint).
+  private mergeSeriesEnabled = false;
+
   private toNovelItems(
     novels: NovelArchiveNovel[] | undefined,
   ): Plugin.NovelItem[] {
-    const valid = (novels || []).filter(
-      (novel): novel is NovelArchiveNovel =>
+    const items = (novels || [])
+      .filter((novel): novel is NovelArchiveNovel =>
         Boolean(novel.id && novel.title),
-    );
+      )
+      .map(novel => ({
+        name: this.cleanText(novel.title) || 'Untitled',
+        path: String(novel.id),
+        cover: this.absoluteUrl(
+          novel.cover_url || novel.novel_image || novel.image_url,
+        ),
+      }));
+
+    if (!this.mergeSeriesEnabled) {
+      return items;
+    }
 
     // Collapse volume/spin-off variants of the same series into a single entry
-    // so the library shows "Re:ZERO" once instead of Vol. 03/04/06/... The API
-    // exposes no series aggregate, so we group by a normalized series key and
-    // keep the volume with the most chapters (the most complete one). O(n),
-    // no extra network calls.
-    const bySeries = new Map<string, NovelArchiveNovel>();
-    for (const novel of valid) {
-      const key = this.toSeriesKey(novel.title || '');
+    // so the library shows "Re:ZERO" once instead of Vol. 03/04/06/... Keep the
+    // volume with the most chapters (the most complete one). O(n), no extra
+    // network calls.
+    const bySeries = new Map<string, Plugin.NovelItem>();
+    for (const item of items) {
+      const key = this.toSeriesKey(item.name || '');
       if (!key) continue;
       const existing = bySeries.get(key);
-      if (
-        !existing ||
-        this.toPositiveInteger(novel.total_chapters) >
-          this.toPositiveInteger(existing.total_chapters)
-      ) {
-        bySeries.set(key, novel);
+      if (!existing) {
+        bySeries.set(key, item);
       }
     }
 
-    return [...bySeries.values()].map(novel => ({
-      name: this.cleanText(novel.title) || 'Untitled',
-      path: String(novel.id),
-      cover: this.absoluteUrl(
-        novel.cover_url || novel.novel_image || novel.image_url,
-      ),
-    }));
+    return [...bySeries.values()];
   }
 
   private toSeriesKey(title: string): string {

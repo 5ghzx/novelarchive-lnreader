@@ -1,8 +1,14 @@
 # Novel Archive — LNReader Plugin (Unofficial)
 
-An [LNReader](https://lnreader.app) plugin for [Novel Archive](https://novelarchive.cc), a novel aggregator with a public JSON API.
-
 > ⚠️ Unofficial. Not affiliated with or endorsed by LNReader or Novel Archive.
+
+## ⚠️ AI-generated software
+
+This plugin was generated with AI assistance.
+
+> I understand that AI generated software has a reputation for being of poor
+> quality, but I am certain this task was simple enough for AI to handle while
+> I focused on other things like reading and enjoying.
 
 ## Install
 
