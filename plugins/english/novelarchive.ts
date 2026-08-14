@@ -98,12 +98,17 @@ class NovelArchivePlugin implements Plugin.PluginBase {
   name = 'Novel Archive';
   icon = 'src/en/novelarchive/icon.png';
   site = 'https://novelarchive.cc';
-  version = '1.1.5';
+  version = '1.1.6';
   pluginSettings = {
     mergeSeries: {
       label: 'Merge volume variants into one series',
       type: 'Switch',
       value: false,
+    },
+    fuzzySearch: {
+      label: 'Fuzzy search',
+      type: 'Switch',
+      value: true,
     },
   };
   private storage?: Storage;
@@ -148,6 +153,15 @@ class NovelArchivePlugin implements Plugin.PluginBase {
       },
       label: 'Genres',
       options: GENRE_OPTIONS,
+    },
+    genreMatch: {
+      type: FilterTypes.Picker,
+      value: 'all',
+      label: 'Genre match',
+      options: [
+        { label: 'All selected', value: 'all' },
+        { label: 'Any selected', value: 'any' },
+      ],
     },
   } satisfies Filters;
   imageRequestInit: Plugin.ImageRequestInit = {
@@ -219,11 +233,7 @@ class NovelArchivePlugin implements Plugin.PluginBase {
     pageNo: number,
   ): Promise<Plugin.NovelItem[]> {
     const query = searchTerm.trim();
-
-    if (!query) {
-      return [];
-    }
-
+    const fuzzyEnabled = this.storage?.get('fuzzySearch') ?? true;
     // The NovelArchive search index ranks concatenated/lower-cased tokens
     // highest. A single punctuated token like "re:zero" returns garbage, but
     // "rezero" returns the correct series first. For space-free queries, strip
@@ -237,7 +247,7 @@ class NovelArchivePlugin implements Plugin.PluginBase {
       search: normalized,
       page: String(Math.max(1, pageNo)),
       per_page: '20',
-      fuzzy: '1',
+      fuzzy: fuzzyEnabled ? '1' : '0',
     });
     const response = await this.apiGet<NovelsResponse>(
       `/api/novels?${params.toString()}`,
@@ -312,6 +322,11 @@ class NovelArchivePlugin implements Plugin.PluginBase {
       params.set('genres_exclude', excludedGenres.join(','));
     }
 
+    const genreMatch = this.cleanText(filters?.genreMatch.value);
+    if (genreMatch && genreMatch !== 'all') {
+      params.set('genre_match', genreMatch); // 'any'
+    }
+
     return `/api/novels?${params.toString()}`;
   }
 
@@ -326,12 +341,14 @@ class NovelArchivePlugin implements Plugin.PluginBase {
     const status = this.cleanText(filters.status.value);
     const includedGenres = this.toStringList(filters.genre.value.include);
     const excludedGenres = this.toStringList(filters.genre.value.exclude);
+    const genreMatch = this.cleanText(filters.genreMatch.value);
 
     return (
       (sort !== '' && sort !== 'recent') ||
       (status !== '' && status !== 'all') ||
       includedGenres.length > 0 ||
-      excludedGenres.length > 0
+      excludedGenres.length > 0 ||
+      (genreMatch !== '' && genreMatch !== 'all')
     );
   }
   private toNovelItems(
