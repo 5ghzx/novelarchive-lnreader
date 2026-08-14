@@ -3,7 +3,7 @@ import type { Plugin } from '@/types/plugin';
 import { FilterTypes, type Filters } from '@libs/filterInputs';
 import { defaultCover } from '@libs/defaultCover';
 import { NovelStatus } from '@libs/novelStatus';
-import { Storage } from '@libs/storage';
+import { storage } from '@libs/storage';
 
 const GENRE_OPTIONS = [
   { label: 'Action', value: 'action' },
@@ -98,7 +98,7 @@ class NovelArchivePlugin implements Plugin.PluginBase {
   name = 'Novel Archive';
   icon = 'src/en/novelarchive/icon.png';
   site = 'https://novelarchive.cc';
-  version = '1.1.6';
+  version = '1.1.7';
   pluginSettings = {
     mergeSeries: {
       label: 'Merge volume variants into one series',
@@ -111,17 +111,6 @@ class NovelArchivePlugin implements Plugin.PluginBase {
       value: true,
     },
   };
-  private storage?: Storage;
-  constructor() {
-    try {
-      // LNReader injects @libs/storage as { storage, localStorage, sessionStorage }.
-      // Captured so we can read the user's plugin settings at browse time.
-      const s = require('@libs/storage') as { storage?: Storage } | undefined;
-      this.storage = s?.storage;
-    } catch {
-      this.storage = undefined;
-    }
-  }
   filters = {
     sort: {
       type: FilterTypes.Picker,
@@ -233,7 +222,6 @@ class NovelArchivePlugin implements Plugin.PluginBase {
     pageNo: number,
   ): Promise<Plugin.NovelItem[]> {
     const query = searchTerm.trim();
-    const fuzzyEnabled = this.storage?.get('fuzzySearch') ?? true;
     // The NovelArchive search index ranks concatenated/lower-cased tokens
     // highest. A single punctuated token like "re:zero" returns garbage, but
     // "rezero" returns the correct series first. For space-free queries, strip
@@ -243,6 +231,7 @@ class NovelArchivePlugin implements Plugin.PluginBase {
       ? query
       : query.replace(/[^a-zA-Z0-9]+/g, '');
 
+    const fuzzyEnabled = storage.get('fuzzySearch') ?? true;
     const params = new URLSearchParams({
       search: normalized,
       page: String(Math.max(1, pageNo)),
@@ -367,17 +356,21 @@ class NovelArchivePlugin implements Plugin.PluginBase {
       }));
 
     // Merge is opt-in via the plugin setting "Merge volume variants into one
-    // series". When off (default) the API's volume entries pass through
-    // untouched, so browse/search reflect exactly what the source returns.
-    if (!this.storage?.get('mergeSeries')) {
+    // series". The setting is read from the host-injected `storage` (see the
+    // top-level `import { storage }`), which the app populates from the
+    // plugin's settings UI. When off (default), volume entries pass through
+    // untouched so browse/search reflect exactly what the source returns.
+    if (!storage.get('mergeSeries')) {
       return items;
     }
 
-    // Merge is opt-in via the plugin setting "Merge volume variants into one
-    // series". NovelArchive has no series API, so volumes are separate entries;
-    // this collapses entries that share a normalized series name into one row,
-    // keeping the volume with the most chapters. Plain Map/Array.from — no
-    // helper wrappers — so it behaves identically in Node and Hermes.
+    // NovelArchive has no series API, so volumes appear as separate entries.
+    // Collapse entries sharing a normalized series name into one row, keeping
+    // the lowest volume (e.g. "Vol 1") as the representative so the same novel
+    // stays at a stable position instead of jumping to an arbitrary volume.
+    // Each survivor keeps its own unique `path`, so the app never renders
+    // duplicate/empty "ghost" rows. Plain Map/Array.from — no helper wrappers
+    // — so it behaves identically in Node and Hermes.
     const bySeries = new Map<string, Plugin.NovelItem>();
     for (const item of items) {
       const key = this.toSeriesKey(item.name || '');
@@ -386,7 +379,7 @@ class NovelArchivePlugin implements Plugin.PluginBase {
         continue;
       }
       const existing = bySeries.get(key);
-      if (!existing) {
+      if (!existing || this.volumeNumber(item.name) < this.volumeNumber(existing.name)) {
         bySeries.set(key, item);
       }
     }
@@ -394,10 +387,18 @@ class NovelArchivePlugin implements Plugin.PluginBase {
     return Array.from(bySeries.values());
   }
 
+  private volumeNumber(name: string): number {
+    const match = name.match(/vol(?:ume)?\.?\s*(\d+)/i);
+    return match ? Number(match[1]) : 0;
+  }
+
   private toSeriesKey(title: string): string {
     return title
-      .replace(/,\s*vol\.?\s*\d+.*$/i, '')
-      .replace(/,\s*volume\s*\d+.*$/i, '')
+      // Strip a trailing volume marker in any of these forms so the separate
+      // volume entries of one series collapse to the same key:
+      //   "Name, Vol 3", "Name Vol 3", "Name Volume 3", "Name (Vol.3)"
+      .replace(/,?\s*vol\.?\s*\d+.*$/i, '')
+      .replace(/,?\s*volume\s*\d+.*$/i, '')
       .replace(/:\s*book\s*\d+.*$/i, '')
       .replace(/\(light novel[^)]*\)/i, '')
       .replace(/[^a-z0-9]+/gi, ' ')
