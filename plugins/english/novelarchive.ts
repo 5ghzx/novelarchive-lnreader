@@ -97,7 +97,7 @@ class NovelArchivePlugin implements Plugin.PluginBase {
   name = 'NovelArchive';
   icon = 'src/en/novelarchive/icon.png';
   site = 'https://novelarchive.cc';
-  version = '1.0.1';
+  version = '1.0.2';
   filters = {
     sort: {
       type: FilterTypes.Picker,
@@ -319,15 +319,49 @@ class NovelArchivePlugin implements Plugin.PluginBase {
   private toNovelItems(
     novels: NovelArchiveNovel[] | undefined,
   ): Plugin.NovelItem[] {
-    return (novels || [])
-      .filter(novel => novel.id && novel.title)
-      .map(novel => ({
-        name: this.cleanText(novel.title) || 'Untitled',
-        path: String(novel.id),
-        cover: this.absoluteUrl(
-          novel.cover_url || novel.novel_image || novel.image_url,
-        ),
-      }));
+    const valid = (novels || []).filter(
+      (novel): novel is NovelArchiveNovel =>
+        Boolean(novel.id && novel.title),
+    );
+
+    // Collapse volume/spin-off variants of the same series into a single entry
+    // so the library shows "Re:ZERO" once instead of Vol. 03/04/06/... The API
+    // exposes no series aggregate, so we group by a normalized series key and
+    // keep the volume with the most chapters (the most complete one). O(n),
+    // no extra network calls.
+    const bySeries = new Map<string, NovelArchiveNovel>();
+    for (const novel of valid) {
+      const key = this.toSeriesKey(novel.title || '');
+      if (!key) continue;
+      const existing = bySeries.get(key);
+      if (
+        !existing ||
+        this.toPositiveInteger(novel.total_chapters) >
+          this.toPositiveInteger(existing.total_chapters)
+      ) {
+        bySeries.set(key, novel);
+      }
+    }
+
+    return [...bySeries.values()].map(novel => ({
+      name: this.cleanText(novel.title) || 'Untitled',
+      path: String(novel.id),
+      cover: this.absoluteUrl(
+        novel.cover_url || novel.novel_image || novel.image_url,
+      ),
+    }));
+  }
+
+  private toSeriesKey(title: string): string {
+    return title
+      .replace(/,\s*vol\.?\s*\d+.*$/i, '')
+      .replace(/,\s*volume\s*\d+.*$/i, '')
+      .replace(/:\s*book\s*\d+.*$/i, '')
+      .replace(/\(light novel[^)]*\)/i, '')
+      .replace(/[^\p{L}\p{N}]+/gu, ' ')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .toLowerCase();
   }
 
   private toChapters(
