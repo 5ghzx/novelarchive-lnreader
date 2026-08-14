@@ -98,7 +98,7 @@ class NovelArchivePlugin implements Plugin.PluginBase {
   name = 'Novel Archive';
   icon = 'src/en/novelarchive/icon.png';
   site = 'https://novelarchive.cc';
-  version = '1.1.7';
+  version = '1.1.8';
   pluginSettings = {
     mergeSeries: {
       label: 'Merge volume variants into one series',
@@ -114,7 +114,7 @@ class NovelArchivePlugin implements Plugin.PluginBase {
   filters = {
     sort: {
       type: FilterTypes.Picker,
-      value: 'recent',
+      value: 'popular',
       label: 'Sort by',
       options: [
         { label: 'Recent', value: 'recent' },
@@ -279,25 +279,32 @@ class NovelArchivePlugin implements Plugin.PluginBase {
     filters: Plugin.PopularNovelsOptions<typeof this.filters>['filters'],
   ): string {
     if (showLatestNovels) {
-      return '/api/novels/recently-updated?limit=20';
+      // recently-updated supports real pagination via offset (page 2 returns
+      // different novels), unlike trending which ignores page/offset and
+      // returns identical items — that duplication is what rendered as the
+      // "ghost books" on scroll.
+      const offset = (Math.max(1, pageNo) - 1) * 20;
+      return `/api/novels/recently-updated?limit=20&offset=${offset}`;
     }
 
-    if (!this.hasActiveBrowseFilters(filters)) {
-      return '/api/novels/trending?limit=20';
-    }
-
+    // Default home browse (no active filters) and any sorted/filtered browse
+    // all go through the paginated /api/novels endpoint with sort=popular as
+    // the default. sort=popular and per_page/page paginate correctly, so the
+    // app's infinite list never repeats rows (no ghosts).
     const params = new URLSearchParams({
       page: String(Math.max(1, pageNo)),
       per_page: '20',
     });
+    // sort=popular is the default home ranking; the user can override it via
+    // the Sort-by filter (Recent/Popular/Top Rated/Chapters). Every value here
+    // paginates correctly, so the list never repeats rows (no ghosts).
     const sort = this.cleanText(filters?.sort.value);
+    if (sort) {
+      params.set('sort', sort);
+    }
     const status = this.cleanText(filters?.status.value);
     const includedGenres = this.toStringList(filters?.genre.value.include);
     const excludedGenres = this.toStringList(filters?.genre.value.exclude);
-
-    if (sort && sort !== 'recent') {
-      params.set('sort', sort);
-    }
 
     if (status && status !== 'all') {
       params.set('status', status);
@@ -319,27 +326,7 @@ class NovelArchivePlugin implements Plugin.PluginBase {
     return `/api/novels?${params.toString()}`;
   }
 
-  private hasActiveBrowseFilters(
-    filters: Plugin.PopularNovelsOptions<typeof this.filters>['filters'],
-  ): boolean {
-    if (!filters) {
-      return false;
-    }
 
-    const sort = this.cleanText(filters.sort.value);
-    const status = this.cleanText(filters.status.value);
-    const includedGenres = this.toStringList(filters.genre.value.include);
-    const excludedGenres = this.toStringList(filters.genre.value.exclude);
-    const genreMatch = this.cleanText(filters.genreMatch.value);
-
-    return (
-      (sort !== '' && sort !== 'recent') ||
-      (status !== '' && status !== 'all') ||
-      includedGenres.length > 0 ||
-      excludedGenres.length > 0 ||
-      (genreMatch !== '' && genreMatch !== 'all')
-    );
-  }
   private toNovelItems(
     novels: NovelArchiveNovel[] | undefined,
   ): Plugin.NovelItem[] {
