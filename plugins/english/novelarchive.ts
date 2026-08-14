@@ -97,7 +97,7 @@ class NovelArchivePlugin implements Plugin.PluginBase {
   name = 'NovelArchive';
   icon = 'src/en/novelarchive/icon.png';
   site = 'https://novelarchive.cc';
-  version = '1.0.2';
+  version = '1.1.0';
   filters = {
     sort: {
       type: FilterTypes.Picker,
