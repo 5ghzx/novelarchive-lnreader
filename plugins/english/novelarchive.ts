@@ -97,7 +97,7 @@ class NovelArchivePlugin implements Plugin.PluginBase {
   name = 'NovelArchive';
   icon = 'src/en/novelarchive/icon.png';
   site = 'https://novelarchive.cc';
-  version = '1.0.0';
+  version = '1.0.1';
   filters = {
     sort: {
       type: FilterTypes.Picker,
@@ -205,8 +205,17 @@ class NovelArchivePlugin implements Plugin.PluginBase {
       return [];
     }
 
+    // The NovelArchive search index ranks concatenated/lower-cased tokens
+    // highest. A single punctuated token like "re:zero" returns garbage, but
+    // "rezero" returns the correct series first. For space-free queries, strip
+    // punctuation so "re:zero" -> "rezero". Multi-word queries keep spaces
+    // (they already rank correctly, e.g. "konosuba god's blessing").
+    const normalized = query.includes(' ')
+      ? query
+      : query.replace(/[^a-zA-Z0-9]+/g, '');
+
     const params = new URLSearchParams({
-      search: query,
+      search: normalized,
       page: String(Math.max(1, pageNo)),
       per_page: '20',
       fuzzy: '1',
