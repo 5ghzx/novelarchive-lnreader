@@ -98,7 +98,7 @@ class NovelArchivePlugin implements Plugin.PluginBase {
   name = 'Novel Archive';
   icon = 'src/en/novelarchive/icon.png';
   site = 'https://novelarchive.cc';
-  version = '1.1.4';
+  version = '1.1.5';
   pluginSettings = {
     mergeSeries: {
       label: 'Merge volume variants into one series',
@@ -356,21 +356,25 @@ class NovelArchivePlugin implements Plugin.PluginBase {
       return items;
     }
 
-    // Collapse volume/spin-off variants of the same series into a single entry
-    // so the library shows "Re:ZERO" once instead of Vol. 03/04/06/... Keep the
-    // volume with the most chapters (the most complete one). O(n), no extra
-    // network calls.
+    // Merge is opt-in via the plugin setting "Merge volume variants into one
+    // series". NovelArchive has no series API, so volumes are separate entries;
+    // this collapses entries that share a normalized series name into one row,
+    // keeping the volume with the most chapters. Plain Map/Array.from — no
+    // helper wrappers — so it behaves identically in Node and Hermes.
     const bySeries = new Map<string, Plugin.NovelItem>();
     for (const item of items) {
       const key = this.toSeriesKey(item.name || '');
-      if (!key) continue;
+      if (!key) {
+        bySeries.set(item.path, item);
+        continue;
+      }
       const existing = bySeries.get(key);
       if (!existing) {
         bySeries.set(key, item);
       }
     }
 
-    return [...bySeries.values()];
+    return Array.from(bySeries.values());
   }
 
   private toSeriesKey(title: string): string {
