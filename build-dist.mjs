@@ -38,6 +38,9 @@ const AI_NOTE =
   'software has a reputation for being of poor quality, but I am certain this ' +
   'task was simple enough for AI to handle while I focused on other things ' +
   'like reading and enjoying."';
+// NOTE: the AI note is surfaced in README.md (where the repo is shared), not in
+// the manifest. The official manifest schema has no `description` key, and extra
+// keys risk strict parsers — so we keep the manifest standards-clean.
 
 const manifest = [
   {
@@ -48,7 +51,6 @@ const manifest = [
     version: VERSION,
     url: `${PLUGIN_LINK}/english/novelarchive.js`,
     iconUrl: `${STATIC_LINK}/src/en/novelarchive/icon.png`,
-    description: AI_NOTE,
   },
 ];
 fs.mkdirSync('.dist', { recursive: true });
