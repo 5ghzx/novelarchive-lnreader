@@ -1,56 +1,81 @@
-# NovelArchive LNReader Plugin (Unofficial)
+# Novel Archive — LNReader Plugin (Unofficial)
 
-An [LNReader](https://lnreader.app) plugin for [NovelArchive](https://novelarchive.cc).
+An [LNReader](https://lnreader.app) plugin for [Novel Archive](https://novelarchive.cc), a novel aggregator with a public JSON API.
 
-> Unofficial. Not affiliated with or endorsed by LNReader or NovelArchive.
+> ⚠️ Unofficial. Not affiliated with or endorsed by LNReader or Novel Archive.
 
-## ⚠️ AI-generated software
+## Install
 
-This plugin was generated with AI assistance.
+1. In LNReader go to **Plugins → Add repository**.
+2. Paste this URL:
 
-> I understand that AI generated software has a reputation for being of poor
-> quality, but I am certain this task was simple enough for AI to handle while
-> I focused on other things like reading and enjoying.
+   ```
+   https://raw.githubusercontent.com/5ghzx/novelarchive-lnreader/main/.dist/plugins.min.json
+   ```
 
-## Add to LNReader
+3. Tap **Novel Archive** in the list to install it.
+4. After install, open the plugin from **Sources** to browse or search.
 
-In LNReader → **Plugins → Add repository**, paste:
+### Updating
 
+The repository URL always serves the latest build. To get an update, **refresh the
+source** (or the repository) in LNReader — the app compares the `version` in the
+manifest and offers the update. No need to remove and re-add the repository.
+
+## Features
+
+- **Browse**: trending novels, recently updated ("Latest"), and filtered views
+  (sort, status, genres — include/exclude).
+- **Search**: by title. Single-token queries with punctuation are normalized
+  (e.g. `re:zero` → `rezero`) so the right series comes up first. Multi-word
+  queries keep their spaces.
+- **Series de-duplication**: Novel Archive returns each volume as a separate entry.
+  The plugin collapses volume variants of the same series into one listing (the
+  volume with the most chapters), so you don't get ten "Re:Zero Vol. N" rows.
+- **Novel details**: cover, author, genres, status, summary, and the full chapter
+  list.
+- **Reading**: chapter content is fetched and rendered in the reader.
+
+## Repository layout
+
+| Path | Purpose |
+|------|---------|
+| `plugins/english/novelarchive.ts` | Plugin source (TypeScript) |
+| `public/static/src/en/novelarchive/icon.png` | 96×96 plugin icon |
+| `.js/src/plugins/english/novelarchive.js` | Compiled plugin served to the app |
+| `.dist/plugins.min.json` | Repository manifest (the add-repo URL target) |
+| `build-dist.mjs` | Build script: compiles, minifies, writes the manifest |
+
+## Build from source
+
+This repo is a standalone mirror of the plugin. To rebuild the artifacts you need
+Node.js ≥ 22 and the `lnreader-plugins` toolchain available (types, `@libs/*`,
+terser). From the `lnreader-plugins` checkout:
+
+```bash
+# validate the plugin against the live API (all four checks must pass)
+npm run check:plugin -- plugins/english/novelarchive.ts
+
+# produce the compiled plugin + manifest
+npx tsc --project tsconfig.production.json
+node build-dist.mjs
 ```
-https://raw.githubusercontent.com/5ghzx/novelarchive-lnreader/main/.dist/plugins.min.json
-```
 
-Then install **NovelArchive** from the list. Updates are automatic: the same
-URL always serves the latest plugin, and the app offers an update whenever the
-`version` in the manifest increases. You do not need to re-add the repository.
+`build-dist.mjs` reads the plugin's own `version` field and writes it into the
+manifest, so the two never drift.
 
-## What it supports
+## Notes & limitations
 
-- Browse: trending, recently-updated (Latest), and filtered (sort, status, genres)
-- Search
-- Novel info (cover, author, genres, status, summary) and full chapter list
-- Chapter reading
-
-## Layout
-
-- `plugins/english/novelarchive.ts` — plugin source
-- `public/static/src/en/novelarchive/icon.png` — 96×96 icon
-- `.js/src/plugins/english/novelarchive.js` — compiled plugin (served to the app)
-- `.dist/plugins.min.json` — repository manifest
-
-## Verification
-
-Built against the live NovelArchive API. `npm run check:plugin` (from
-`lnreader/lnreader-plugins`) reports all four checks passing:
-`popularNovels`, `searchNovels`, `parseNovel`, `parseChapter`.
+- The plugin talks to Novel Archive's public JSON API directly; if that API
+  changes or goes down, the plugin stops working until updated.
+- Volume merging is a search/browse convenience. Opening a listing opens that
+  volume's chapters; Novel Archive has no series-aggregate endpoint, so cross-volume
+  chapter stitching is intentionally not done.
+- This plugin was generated with AI assistance and reviewed against the live API.
+  Report issues via the repo's issue tracker.
 
 ## Disclaimer
 
-This plugin scrapes a third-party site that may host copyrighted or machine-translated
-content. Use at your own risk and respect the rights of authors and translators.
-
-## Contributing to the official repo
-
-To submit this to `lnreader/lnreader-plugins`, open a PR with
-`plugins/english/novelarchive.ts`. The maintainers require `npm run check:plugin`
-to pass (it does) and may ask you to explain the code — be ready to stand behind it.
+This plugin accesses a third-party site that may host copyrighted or
+machine-translated content. Use at your own risk and respect the rights of
+authors and translators.
