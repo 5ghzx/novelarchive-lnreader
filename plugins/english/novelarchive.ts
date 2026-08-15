@@ -98,7 +98,7 @@ class NovelArchivePlugin implements Plugin.PluginBase {
   name = 'Novel Archive';
   icon = 'src/en/novelarchive/icon.png';
   site = 'https://novelarchive.cc';
-  version = '1.1.11';
+  version = '1.1.12';
   pluginSettings = {
     mergeSeries: {
       label: 'Merge volume variants into one series',
@@ -204,8 +204,67 @@ class NovelArchivePlugin implements Plugin.PluginBase {
       summary: this.cleanText(source.description) || undefined,
       chapters: this.toChapters(id, source),
     };
+    // Merge volumes: NovelArchive has no series concept -- each "Vol N" is an
+    // independent novel with its own id and chapter list, and its chapters are
+    // numbered across the whole series (Vol 3 starts at Chapter 8), not 1..N
+    // per volume. So a naive collapse just hides the other volumes. When merge
+    // is on, rediscover every sibling volume via search and concatenate all
+    // their chapters (deduped by number, sorted ascending) so one row exposes
+    // the full series contiguously.
+    if (storage.get('mergeSeries')) {
+      try {
+        const key = this.toSeriesKey(source.title);
+        const fuzzyEnabled = storage.get('fuzzySearch') ?? true;
+        const queries = [
+          this.mergeSearchToken(source.title), // e.g. "rezero" -- catches Vol 1
+          this.baseTitle(source.title), // full base title
+        ].filter(Boolean);
+
+        const volumeIds = new Map<string, string>();
+        for (const q of queries) {
+          const search = await this.apiGet<NovelsResponse>(
+            `/api/novels?search=${encodeURIComponent(q)}&per_page=50&fuzzy=${
+              fuzzyEnabled ? '1' : '0'
+            }`,
+          );
+          for (const n of search.novels || []) {
+            if (this.toSeriesKey(n.title) !== key) continue;
+            const vid = String(n.id);
+            if (vid) volumeIds.set(vid, vid);
+          }
+        }
+        const ids = Array.from(volumeIds.values()).slice(0, 30);
+
+        const seen = new Set<number>();
+        const merged: Plugin.ChapterItem[] = [];
+        for (const vid of ids) {
+          const items = await this.fetchVolumeChapters(vid);
+          for (const ch of items) {
+            if (seen.has(ch.chapterNumber)) continue;
+            seen.add(ch.chapterNumber);
+            merged.push(ch);
+          }
+        }
+        merged.sort((a, b) => a.chapterNumber - b.chapterNumber);
+        if (merged.length) novel.chapters = merged;
+      } catch {
+        // Fall back to the single volume's chapters if discovery fails.
+      }
+    }
 
     return novel;
+  }
+
+  private async fetchVolumeChapters(
+    volumeId: string,
+  ): Promise<Plugin.ChapterItem[]> {
+    const response = await this.apiGet<NovelResponse>(
+      `/api/novels/${encodeURIComponent(volumeId)}`,
+    );
+    const novel = response.novel;
+    if (!novel) return [];
+    // Path encodes the volume id so parseChapter resolves the right chapter.
+    return this.toChapters(volumeId, novel);
   }
 
   async parseChapter(chapterPath: string): Promise<string> {
@@ -398,12 +457,30 @@ class NovelArchivePlugin implements Plugin.PluginBase {
         continue;
       }
       const existing = bySeries.get(key);
-      if (!existing || this.volumeNumber(item.name) < this.volumeNumber(existing.name)) {
-        bySeries.set(key, item);
+      // Keep the lowest-numbered volume as the representative (so opening it
+      // aggregates Vol 1..N), and show the base series title instead of a
+      // single volume's name.
+      if (
+        !existing ||
+        this.volumeNumber(item.name) < this.volumeNumber(existing.name)
+      ) {
+        bySeries.set(key, {
+          ...item,
+          name: this.cleanText(this.baseTitle(item.name)) || item.name,
+        });
       }
     }
 
     return Array.from(bySeries.values());
+  }
+
+  private baseTitle(title: string): string {
+    return String(title || '')
+      .replace(/,?\s*vol\.?\s*\d+.*$/i, '')
+      .replace(/,?\s*volume\s*\d+.*$/i, '')
+      .replace(/:\s*book\s*\d+.*$/i, '')
+      .replace(/\(light novel[^)]*\)/i, '')
+      .trim();
   }
 
   private volumeNumber(name: string): number {
@@ -424,6 +501,15 @@ class NovelArchivePlugin implements Plugin.PluginBase {
       .replace(/\s+/g, ' ')
       .trim()
       .toLowerCase();
+  }
+  private mergeSearchToken(title: string): string {
+    // The source's search ranks short concatenated tokens (e.g. "rezero"
+    // surfaces Vol 1..N), whereas the full volume-stripped base title often
+    // misses the earliest volumes. Use the lowercased first significant word
+    // as a fallback discovery query.
+    const base = this.baseTitle(title).replace(/\s+/g, ' ').trim();
+    const first = (base.split(' ')[0] || base).replace(/[^a-zA-Z0-9]/g, '');
+    return first.toLowerCase();
   }
 
   private toChapters(
