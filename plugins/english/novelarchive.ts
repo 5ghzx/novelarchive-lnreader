@@ -94,11 +94,11 @@ type ChapterResponse = {
 };
 
 class NovelArchivePlugin implements Plugin.PluginBase {
-  id = 'novelarchive2';
+  id = 'novelarchive';
   name = 'Novel Archive';
   icon = 'src/en/novelarchive/icon.png';
   site = 'https://novelarchive.cc';
-  version = '1.1.15';
+  version = '1.1.16';
   pluginSettings = {
     mergeSeries: {
       label: 'Merge volume variants into one series',
@@ -211,8 +211,7 @@ class NovelArchivePlugin implements Plugin.PluginBase {
     // is on, rediscover every sibling volume via search and concatenate all
     // their chapters (deduped by number, sorted ascending) so one row exposes
     // the full series contiguously.
-    const mergeOn = Boolean(storage.get('mergeSeries'));
-    if (mergeOn) {
+    if (storage.get('mergeSeries')) {
       try {
         const key = this.toSeriesKey(source.title);
         const fuzzyEnabled = storage.get('fuzzySearch') ?? true;
@@ -247,17 +246,10 @@ class NovelArchivePlugin implements Plugin.PluginBase {
           }
         }
         merged.sort((a, b) => a.chapterNumber - b.chapterNumber);
-        if (merged.length) {
-          novel.chapters = merged;
-          novel.name = `${novel.name} · MERGED ${ids.length}vols/${merged.length}ch`;
-        } else {
-          novel.name = `${novel.name} · MERGE-EMPTY(${ids.length}vols)`;
-        }
-      } catch (e) {
-        novel.name = `${novel.name} · MERGE-ERR(${String((e as Error)?.message || e).slice(0,40)})`;
+        if (merged.length) novel.chapters = merged;
+      } catch {
+        // Fall back to the single volume's chapters if discovery fails.
       }
-    } else {
-      novel.name = `${novel.name} · MERGE-OFF`;
     }
 
     return novel;
@@ -474,7 +466,7 @@ class NovelArchivePlugin implements Plugin.PluginBase {
       ) {
         bySeries.set(key, {
           ...item,
-          name: `${this.cleanText(this.baseTitle(item.name)) || item.name} · MERGE-ON`,
+          name: this.cleanText(this.baseTitle(item.name)) || item.name,
         });
       }
     }
