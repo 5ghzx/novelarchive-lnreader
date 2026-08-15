@@ -98,7 +98,7 @@ class NovelArchivePlugin implements Plugin.PluginBase {
   name = 'Novel Archive';
   icon = 'src/en/novelarchive/icon.png';
   site = 'https://novelarchive.cc';
-  version = '1.1.16';
+  version = '1.1.17';
   pluginSettings = {
     mergeSeries: {
       label: 'Merge volume variants into one series',
@@ -165,6 +165,10 @@ class NovelArchivePlugin implements Plugin.PluginBase {
   // forever, appending duplicate series as empty/ghost rows. We terminate
   // pagination ourselves by returning [] once a page contributes nothing new.
   private searchSeen = new Set<string>();
+  // Cache of seriesKey -> volume ids, discovered during merge. The NovelArchive
+  // API has no series endpoint, so we rediscover volumes via search; caching
+  // avoids re-hitting the API on every parseNovel (e.g. library refresh).
+  private seriesVolumes = new Map<string, string[]>();
 
   async popularNovels(
     pageNo: number,
@@ -209,39 +213,56 @@ class NovelArchivePlugin implements Plugin.PluginBase {
     // numbered across the whole series (Vol 3 starts at Chapter 8), not 1..N
     // per volume. So a naive collapse just hides the other volumes. When merge
     // is on, rediscover every sibling volume via search and concatenate all
-    // their chapters (deduped by number, sorted ascending) so one row exposes
-    // the full series contiguously.
     if (storage.get('mergeSeries')) {
       try {
         const key = this.toSeriesKey(source.title);
-        const fuzzyEnabled = storage.get('fuzzySearch') ?? true;
-        const queries = [
-          this.mergeSearchToken(source.title), // e.g. "rezero" -- catches Vol 1
-          this.baseTitle(source.title), // full base title
-        ].filter(Boolean);
-
-        const volumeIds = new Map<string, string>();
-        for (const q of queries) {
-          const search = await this.apiGet<NovelsResponse>(
-            `/api/novels?search=${encodeURIComponent(q)}&per_page=50&fuzzy=${
-              fuzzyEnabled ? '1' : '0'
-            }`,
+        // Cached discovery: avoids re-searching the API on every open / library
+        // refresh. The API has no series endpoint, so we find sibling volumes
+        // by searching (short token + full base title) and keeping matches.
+        let ids = this.seriesVolumes.get(key);
+        if (!ids) {
+          const fuzzyEnabled = storage.get('fuzzySearch') ?? true;
+          const queries = [
+            this.mergeSearchToken(source.title),
+            this.baseTitle(source.title),
+          ].filter(Boolean);
+          const results = await Promise.all(
+            queries.map(q =>
+              this.apiGet<NovelsResponse>(
+                `/api/novels?search=${encodeURIComponent(q)}&per_page=50&fuzzy=${
+                  fuzzyEnabled ? '1' : '0'
+                }`,
+              ).catch(() => ({ novels: [] as NovelArchiveNovel[] })),
+            ),
           );
-          for (const n of search.novels || []) {
-            if (this.toSeriesKey(n.title) !== key) continue;
-            const vid = String(n.id);
-            if (vid) volumeIds.set(vid, vid);
+          const seen = new Set<string>();
+          const collected: string[] = [];
+          for (const r of results) {
+            for (const n of r.novels || []) {
+              if (this.toSeriesKey(n.title) !== key) continue;
+              const vid = String(n.id);
+              if (vid && !seen.has(vid)) {
+                seen.add(vid);
+                collected.push(vid);
+              }
+            }
           }
+          ids = collected.slice(0, 30);
+          this.seriesVolumes.set(key, ids);
         }
-        const ids = Array.from(volumeIds.values()).slice(0, 30);
 
-        const seen = new Set<number>();
+        // Fetch every volume's chapters in parallel; a slow/empty volume must
+        // not stall the whole novel (no infinite "loading").
+        const settled = await Promise.allSettled(
+          ids.map(vid => this.fetchVolumeChapters(vid)),
+        );
+        const seenCh = new Set<number>();
         const merged: Plugin.ChapterItem[] = [];
-        for (const vid of ids) {
-          const items = await this.fetchVolumeChapters(vid);
-          for (const ch of items) {
-            if (seen.has(ch.chapterNumber)) continue;
-            seen.add(ch.chapterNumber);
+        for (const s of settled) {
+          if (s.status !== 'fulfilled') continue;
+          for (const ch of s.value) {
+            if (seenCh.has(ch.chapterNumber)) continue;
+            seenCh.add(ch.chapterNumber);
             merged.push(ch);
           }
         }
@@ -258,10 +279,15 @@ class NovelArchivePlugin implements Plugin.PluginBase {
   private async fetchVolumeChapters(
     volumeId: string,
   ): Promise<Plugin.ChapterItem[]> {
-    const response = await this.apiGet<NovelResponse>(
-      `/api/novels/${encodeURIComponent(volumeId)}`,
-    );
-    const novel = response.novel;
+    // Cap each volume fetch so one slow/empty volume can't stall the whole
+    // merged novel (which would show as "loading forever").
+    const TIMEOUT_MS = 8000;
+    const timed = Promise.race([
+      this.apiGet<NovelResponse>(`/api/novels/${encodeURIComponent(volumeId)}`),
+      new Promise<NovelResponse>((resolve) => setTimeout(resolve, TIMEOUT_MS)),
+    ]);
+    const response = await timed;
+    const novel = response?.novel;
     if (!novel) return [];
     // Path encodes the volume id so parseChapter resolves the right chapter.
     return this.toChapters(volumeId, novel);
