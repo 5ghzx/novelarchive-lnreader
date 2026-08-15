@@ -98,7 +98,7 @@ class NovelArchivePlugin implements Plugin.PluginBase {
   name = 'Novel Archive';
   icon = 'src/en/novelarchive/icon.png';
   site = 'https://novelarchive.cc';
-  version = '1.1.13';
+  version = '1.1.14';
   pluginSettings = {
     mergeSeries: {
       label: 'Merge volume variants into one series',
@@ -474,7 +474,7 @@ class NovelArchivePlugin implements Plugin.PluginBase {
       ) {
         bySeries.set(key, {
           ...item,
-          name: this.cleanText(this.baseTitle(item.name)) || item.name,
+          name: `${this.cleanText(this.baseTitle(item.name)) || item.name} · MERGE-ON`,
         });
       }
     }
