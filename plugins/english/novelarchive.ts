@@ -102,10 +102,9 @@ const CHAPTER_NAME_RE = /^chapter\s*(\d+)/i;
 
 class NovelArchivePlugin implements Plugin.PluginBase {
   id = 'novelarchive';
-  version = '1.1.20';
+  version = '1.1.21';
   icon = 'src/en/novelarchive/icon.png';
   site = 'https://novelarchive.cc';
-  version = '1.1.18';
   pluginSettings = {
     mergeSeries: {
       label: 'Merge volume variants into one series',
@@ -116,6 +115,11 @@ class NovelArchivePlugin implements Plugin.PluginBase {
       label: 'Fuzzy search',
       type: 'Switch',
       value: true,
+    },
+    skipUnavailable: {
+      label: 'Skip unavailable chapters (scan & renumber)',
+      type: 'Switch',
+      value: false,
     },
   };
   filters = {
@@ -179,6 +183,10 @@ class NovelArchivePlugin implements Plugin.PluginBase {
   // Per-volume detail fetch cap (ms) during merge, so a single slow/hanging
   // volume can't stall the whole novel ("loading forever").
   private static readonly VOLUME_TIMEOUT_MS = 8000;
+  // Concurrency for the eager "skip unavailable" scan: how many chapter
+  // availability probes run in parallel. NovelArchive (Cloudflare) showed no
+  // rate limiting at 150 parallel requests; 64 keeps the burst polite.
+  private static readonly SKIP_CONCURRENCY = 64;
 
   async popularNovels(
     pageNo: number,
@@ -316,6 +324,14 @@ class NovelArchivePlugin implements Plugin.PluginBase {
       }
     }
 
+    // Eager "skip unavailable": probe every chapter in parallel, drop the ones
+    // that 404 on the source (no content), and renumber survivors 1..N. Runs
+    // once; the app caches the filtered list. Disabled by default (lazy
+    // auto-forward handles 404s on read instead).
+    if (storage.get('skipUnavailable')) {
+      novel.chapters = await this.filterUnavailableChapters(novel.chapters);
+    }
+
     return novel;
   }
 
@@ -357,20 +373,115 @@ class NovelArchivePlugin implements Plugin.PluginBase {
     }
   }
 
+  // Probe a single chapter without downloading its body: true when the API
+  // responds with content (200), false on 404 / error. The eager "skip
+  // unavailable" scan uses this so we don't pull every chapter's text just to
+  // find which exist.
+  private async probeChapterAvailable(
+    novelId: string,
+    chapterNumber: number,
+  ): Promise<boolean> {
+    try {
+      const response = await this.apiGet<ChapterResponse>(
+        `/api/novels/${encodeURIComponent(novelId)}/chapters/${encodeURIComponent(
+          String(chapterNumber),
+        )}`,
+      );
+      return Boolean(response.chapter?.content);
+    } catch {
+      return false;
+    }
+  }
+
+  // Eager mode: probe every chapter in parallel (bounded by
+  // SKIP_CONCURRENCY), drop the ones that 404 / have no content, and renumber
+  // the survivors 1..N. Runs once; the app caches the resulting list. A probe
+  // failure means "keep" -- we don't drop a chapter we couldn't verify.
+  private async filterUnavailableChapters(
+    chapters: Plugin.ChapterItem[],
+  ): Promise<Plugin.ChapterItem[]> {
+    if (!chapters.length) return chapters;
+    const tasks = chapters.map(async ch => {
+      const [novelId, num] = ch.path.split('/');
+      const available = await this.probeChapterAvailable(novelId, Number(num));
+      // Unverifiable (network error) -> keep, don't drop.
+      return available ? ch : null;
+    });
+    const settled = await this.runWithConcurrency(
+      tasks,
+      NovelArchivePlugin.SKIP_CONCURRENCY,
+    );
+    const kept = settled.filter(
+      (c): c is Plugin.ChapterItem => c !== null,
+    );
+    return kept.map((ch, n) => ({ ...ch, chapterNumber: n + 1 }));
+  }
+
+  // Run async tasks with a bounded concurrency limit, preserving input order.
+  private async runWithConcurrency<T>(
+    tasks: Promise<T>[],
+    limit: number,
+  ): Promise<T[]> {
+    const { promise, resolve } = Promise.withResolvers<T[]>();
+    const results: T[] = new Array(tasks.length);
+    let active = 0;
+    let cursor = 0;
+    const next = () => {
+      while (active < limit && cursor < tasks.length) {
+        const i = cursor++;
+        active++;
+        tasks[i]
+          .then(v => {
+            results[i] = v;
+          })
+          .catch(() => {
+            results[i] = undefined as T;
+          })
+          .finally(() => {
+            active--;
+            if (cursor >= tasks.length && active === 0) resolve(results);
+            else next();
+          });
+      }
+    };
+    next();
+    return promise;
+  }
+
   async parseChapter(chapterPath: string): Promise<string> {
     const { novelId, chapterNumber } = this.parseChapterPath(chapterPath);
-    const response = await this.apiGet<ChapterResponse>(
-      `/api/novels/${encodeURIComponent(novelId)}/chapters/${encodeURIComponent(
-        chapterNumber,
-      )}`,
-    );
-    const content = response.chapter?.content;
+    const num = Number(chapterNumber);
 
-    if (!content) {
+    const fetchContent = async (n: number): Promise<string | undefined> => {
+      try {
+        const response = await this.apiGet<ChapterResponse>(
+          `/api/novels/${encodeURIComponent(novelId)}/chapters/${encodeURIComponent(
+            String(n),
+          )}`,
+        );
+        return response.chapter?.content;
+      } catch {
+        return undefined;
+      }
+    };
+
+    const content = await fetchContent(num);
+    if (content) return this.toChapterHtml(content);
+
+    // The requested chapter is unavailable (404 on the source, e.g. Konosuba
+    // Vol.1 Ch.2 has no text). When the eager "skip unavailable" setting is
+    // OFF we still don't want a hard error -- auto-forward to the next
+    // available chapter so the reader keeps flowing. If it's ON, the list was
+    // already filtered at parseNovel, so a 404 here is unexpected -> error.
+    if (storage.get('skipUnavailable')) {
       throw new Error(`NovelArchive chapter not found: ${chapterPath}`);
     }
 
-    return this.toChapterHtml(content);
+    for (let n = num + 1; n <= num + 5; n++) {
+      const next = await fetchContent(n);
+      if (next) return this.toChapterHtml(next);
+    }
+    throw new Error(`NovelArchive chapter not found: ${chapterPath}`);
   }
 
   async searchNovels(
