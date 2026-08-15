@@ -98,7 +98,7 @@ class NovelArchivePlugin implements Plugin.PluginBase {
   name = 'Novel Archive';
   icon = 'src/en/novelarchive/icon.png';
   site = 'https://novelarchive.cc';
-  version = '1.1.9';
+  version = '1.1.10';
   pluginSettings = {
     mergeSeries: {
       label: 'Merge volume variants into one series',
@@ -114,7 +114,7 @@ class NovelArchivePlugin implements Plugin.PluginBase {
   filters = {
     sort: {
       type: FilterTypes.Picker,
-      value: 'popular',
+      value: 'rating',
       label: 'Sort by',
       options: [
         { label: 'Recent', value: 'recent' },
@@ -329,9 +329,9 @@ class NovelArchivePlugin implements Plugin.PluginBase {
 
   private toNovelItems(
     novels: NovelArchiveNovel[] | undefined,
-    dedupeOnly = false,
+    isSearch = false,
   ): Plugin.NovelItem[] {
-    const items = (novels || [])
+    let items = (novels || [])
       .filter((novel): novel is NovelArchiveNovel =>
         Boolean(novel.id && novel.title),
       )
@@ -346,32 +346,29 @@ class NovelArchivePlugin implements Plugin.PluginBase {
     // The search endpoint returns overlapping IDs across pages (verified:
     // "lotm"/"mother of learning" return the identical set on page 2), which
     // the app's virtualized list re-renders as duplicate "ghost" rows. Drop
-    // any path already seen on this page before returning.
-    if (dedupeOnly) {
+    // any duplicate `path` before returning. Browse endpoints paginate
+    // cleanly, so this only runs for search.
+    if (isSearch) {
       const seen = new Set<string>();
-      return items.filter(item => {
+      items = items.filter(item => {
         if (seen.has(item.path)) return false;
         seen.add(item.path);
         return true;
       });
     }
 
-    // Merge is opt-in via the plugin setting "Merge volume variants into one
-    // series". The setting is read from the host-injected `storage` (see the
-    // top-level `import { storage }`), which the app populates from the
-    // plugin's settings UI. When off (default), volume entries pass through
-    // untouched so browse/search reflect exactly what the source returns.
+    // Merge volumes is opt-in via the plugin setting "Merge volume variants
+    // into one series", read from the host-injected `storage` (top-level
+    // `import { storage }`). NovelArchive returns one row per volume with a
+    // distinct id, so collapse entries sharing a normalized series name into
+    // one row, keeping the lowest volume (e.g. "Vol 1") as the representative.
+    // Each survivor keeps its own unique `path`, so the list never renders
+    // duplicate/empty "ghost" rows and pagination stops promptly (a collapsed
+    // search fits page 1 instead of spawning overlapping pages forever).
     if (!storage.get('mergeSeries')) {
       return items;
     }
 
-    // NovelArchive has no series API, so volumes appear as separate entries.
-    // Collapse entries sharing a normalized series name into one row, keeping
-    // the lowest volume (e.g. "Vol 1") as the representative so the same novel
-    // stays at a stable position instead of jumping to an arbitrary volume.
-    // Each survivor keeps its own unique `path`, so the app never renders
-    // duplicate/empty "ghost" rows. Plain Map/Array.from — no helper wrappers
-    // — so it behaves identically in Node and Hermes.
     const bySeries = new Map<string, Plugin.NovelItem>();
     for (const item of items) {
       const key = this.toSeriesKey(item.name || '');
