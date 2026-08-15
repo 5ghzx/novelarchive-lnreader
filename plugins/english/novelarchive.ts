@@ -102,7 +102,7 @@ const CHAPTER_NAME_RE = /^chapter\s*(\d+)/i;
 
 class NovelArchivePlugin implements Plugin.PluginBase {
   id = 'novelarchive';
-  version = '1.1.19';
+  version = '1.1.20';
   icon = 'src/en/novelarchive/icon.png';
   site = 'https://novelarchive.cc';
   version = '1.1.18';
@@ -230,6 +230,9 @@ class NovelArchivePlugin implements Plugin.PluginBase {
         // refresh. The API has no series endpoint, so we find sibling volumes
         // by searching (short token + full base title) and keeping matches.
         let ids = this.seriesVolumes.get(key);
+        // Volume count for the merge-progress banner (hoisted so it's in scope
+        // whether we just discovered the volumes or used the cache).
+        let volCount = 0;
         if (!ids) {
           const fuzzyEnabled = storage.get('fuzzySearch') ?? true;
           const queries = [
@@ -272,7 +275,10 @@ class NovelArchivePlugin implements Plugin.PluginBase {
             (a, b) => this.volumeNumber(a.title) - this.volumeNumber(b.title),
           );
           ids = collected.map(n => n.id).slice(0, 30);
+          volCount = ids.length;
           this.seriesVolumes.set(key, ids);
+        } else {
+          volCount = ids.length;
         }
 
         // Fetch every volume's chapters in parallel; a slow/empty volume must
@@ -295,7 +301,16 @@ class NovelArchivePlugin implements Plugin.PluginBase {
             merged.push({ ...ch, chapterNumber: seq });
           }
         }
-        if (merged.length) novel.chapters = merged;
+        if (merged.length) {
+          novel.chapters = merged;
+          // Surface the merge in the UI: the app's novel-detail screen renders
+          // `summary`, so a one-line banner confirms merge ran and how many
+          // volumes/chapters were assembled. There is no plugin progress
+          // callback during parseNovel, so this indicator appears once the
+          // detail loads.
+          const banner = `[${volCount} volumes merged — ${merged.length} chapters total]\n`;
+          novel.summary = novel.summary ? banner + novel.summary : banner;
+        }
       } catch {
         // Fall back to the single volume's chapters if discovery fails.
       }
@@ -371,6 +386,17 @@ class NovelArchivePlugin implements Plugin.PluginBase {
     const normalized = query.includes(' ')
       ? query
       : query.replace(/[^a-zA-Z0-9]+/g, '');
+
+    // The NovelArchive API returns the general browse listing (sorted by the
+    // site default, not user filters) when `search` is blank, instead of an
+    // empty result. So a CJK-only query like "鈴木" — our normalization strips
+    // it to "" — or an empty submission would surface the popular/home novels
+    // as if they were search hits. Treat a blank normalized query as
+    // zero-result so the app shows the standard "no results" state.
+    if (!normalized) {
+      if (pageNo <= 1) this.searchSeen.clear();
+      return [];
+    }
 
     const fuzzyEnabled = storage.get('fuzzySearch') ?? true;
     const params = new URLSearchParams({
