@@ -93,9 +93,16 @@ type ChapterResponse = {
   };
 };
 
+// Discovered volume during merge: id + title (for volume-number sorting).
+type DiscoveredVolume = { id: string; title: string };
+
+// Matches "Chapter 1" / "chapter  3" at the start of a chapter name.
+// Hoisted so it isn't recompiled for every chapter in every volume.
+const CHAPTER_NAME_RE = /^chapter\s*(\d+)/i;
+
 class NovelArchivePlugin implements Plugin.PluginBase {
   id = 'novelarchive';
-  name = 'Novel Archive';
+  version = '1.1.19';
   icon = 'src/en/novelarchive/icon.png';
   site = 'https://novelarchive.cc';
   version = '1.1.18';
@@ -169,6 +176,9 @@ class NovelArchivePlugin implements Plugin.PluginBase {
   // API has no series endpoint, so we rediscover volumes via search; caching
   // avoids re-hitting the API on every parseNovel (e.g. library refresh).
   private seriesVolumes = new Map<string, string[]>();
+  // Per-volume detail fetch cap (ms) during merge, so a single slow/hanging
+  // volume can't stall the whole novel ("loading forever").
+  private static readonly VOLUME_TIMEOUT_MS = 8000;
 
   async popularNovels(
     pageNo: number,
@@ -228,7 +238,6 @@ class NovelArchivePlugin implements Plugin.PluginBase {
           ].filter(Boolean);
           // Discover volumes along with their titles so we can sort by volume
           // number; the API returns results in relevance order, not vol order.
-          type Disc = { id: string; title: string };
           const results = await Promise.all(
             queries.map(q =>
               this.apiGet<NovelsResponse>(
@@ -237,16 +246,16 @@ class NovelArchivePlugin implements Plugin.PluginBase {
                 }`,
               )
                 .then(r =>
-                  (r.novels || []).map<Disc>(n => ({
+                  (r.novels || []).map<DiscoveredVolume>(n => ({
                     id: String(n.id),
                     title: n.title,
                   })),
                 )
-                .catch(() => [] as Disc[]),
+                .catch(() => [] as DiscoveredVolume[]),
             ),
           );
           const seen = new Set<string>();
-          const collected: Disc[] = [];
+          const collected: DiscoveredVolume[] = [];
           for (const list of results) {
             for (const n of list) {
               if (this.toSeriesKey(n.title) !== key) continue;
@@ -298,30 +307,39 @@ class NovelArchivePlugin implements Plugin.PluginBase {
   private async fetchVolumeChapters(
     volumeId: string,
   ): Promise<Plugin.ChapterItem[]> {
-    // Cap each volume fetch so one slow/empty volume can't stall the whole
-    // merged novel (which would show as "loading forever").
-    const TIMEOUT_MS = 8000;
-    const timed = Promise.race([
-      this.apiGet<NovelResponse>(`/api/novels/${encodeURIComponent(volumeId)}`),
-      new Promise<NovelResponse>(resolve => setTimeout(() => resolve((undefined as unknown) as NovelResponse), TIMEOUT_MS)),
-    ]);
-    const response = await timed;
-    const novel = response?.novel;
-    if (!novel) return [];
-    const chapters = this.toChapters(volumeId, novel);
-    // Prefix each chapter's display name with its volume number so a merged
-    // multi-volume list reads as one continuous series instead of seventeen
-    // identical "Chapter 1" rows. The path (volumeId/origNumber) is untouched
-    // so parseChapter still resolves content from the correct volume.
-    const vol = this.volumeNumber(novel.title);
-    if (vol > 0) {
-      const re = /^chapter\s*(\d+)/i;
-      for (const ch of chapters) {
-        if (!re.test(ch.name)) continue;
-        ch.name = `Vol. ${vol} Ch. ${ch.name.replace(re, '$1').trim()}`;
+    // Cap each volume fetch so a slow/hanging volume can't stall the whole
+    // merged novel (which would show as "loading forever" on-device). We race
+    // the request against a timer and cancel the timer once it settles, so no
+    // dangling timeout is left running. On timeout we treat it as an empty
+    // volume (skipped), never as a hang.
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const request = this.apiGet<NovelResponse>(
+      `/api/novels/${encodeURIComponent(volumeId)}`,
+    );
+    const timeout = new Promise<NovelResponse>(resolve => {
+      timer = setTimeout(() => resolve({}), NovelArchivePlugin.VOLUME_TIMEOUT_MS);
+    });
+    try {
+      const response = await Promise.race([request, timeout]);
+      const novel = response?.novel;
+      if (!novel) return [];
+      const chapters = this.toChapters(volumeId, novel);
+      // Prefix each chapter's display name with its volume number so a merged
+      // multi-volume list reads as one continuous series instead of seventeen
+      // identical "Chapter 1" rows. The path (volumeId/origNumber) is left
+      // untouched so parseChapter still resolves content from the volume that
+      // actually owns the chapter.
+      const vol = this.volumeNumber(novel.title);
+      if (vol > 0) {
+        for (const ch of chapters) {
+          const match = ch.name.match(CHAPTER_NAME_RE);
+          if (match) ch.name = `Vol. ${vol} Ch. ${match[1]}`;
+        }
       }
+      return chapters;
+    } finally {
+      if (timer) clearTimeout(timer);
     }
-    return chapters;
   }
 
   async parseChapter(chapterPath: string): Promise<string> {
