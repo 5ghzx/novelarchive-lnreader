@@ -94,11 +94,11 @@ type ChapterResponse = {
 };
 
 class NovelArchivePlugin implements Plugin.PluginBase {
-  id = 'novelarchive';
+  id = 'novelarchive2';
   name = 'Novel Archive';
   icon = 'src/en/novelarchive/icon.png';
   site = 'https://novelarchive.cc';
-  version = '1.1.14';
+  version = '1.1.15';
   pluginSettings = {
     mergeSeries: {
       label: 'Merge volume variants into one series',

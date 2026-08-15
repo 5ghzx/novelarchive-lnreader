@@ -44,7 +44,7 @@ const AI_NOTE =
 
 const manifest = [
   {
-    id: 'novelarchive',
+    id: 'novelarchive2',
     name: 'Novel Archive',
     site: 'https://novelarchive.cc',
     lang: 'English',
