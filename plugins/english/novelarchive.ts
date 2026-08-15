@@ -98,7 +98,7 @@ class NovelArchivePlugin implements Plugin.PluginBase {
   name = 'Novel Archive';
   icon = 'src/en/novelarchive/icon.png';
   site = 'https://novelarchive.cc';
-  version = '1.1.10';
+  version = '1.1.11';
   pluginSettings = {
     mergeSeries: {
       label: 'Merge volume variants into one series',
@@ -158,6 +158,13 @@ class NovelArchivePlugin implements Plugin.PluginBase {
       Referer: this.site,
     },
   };
+  // Tracks series-keys (or paths when merge is off) already returned across
+  // search pages. The NovelArchive search API never returns an empty page:
+  // page 2 returns a tail of volumes and every page >=2 repeats that same
+  // tail, so the app's "stop when empty" rule never trips and it fetches
+  // forever, appending duplicate series as empty/ghost rows. We terminate
+  // pagination ourselves by returning [] once a page contributes nothing new.
+  private searchSeen = new Set<string>();
 
   async popularNovels(
     pageNo: number,
@@ -242,15 +249,29 @@ class NovelArchivePlugin implements Plugin.PluginBase {
       `/api/novels?${params.toString()}`,
     );
 
-    return this.toNovelItems(response.novels, true);
+    // A fresh search starts with a clean seen-set so prior searches don't
+    // suppress this one's results.
+    if (pageNo <= 1) this.searchSeen.clear();
+
+    const items = this.toNovelItems(response.novels, true);
+
+    // The search API repeats its tail on every page >=2 and never returns an
+    // empty page, so the app's infinite-scroll would fetch forever and render
+    // duplicate/ghost rows. Drop anything we already returned (by series-key
+    // when merge is on, by path otherwise) and, if a page adds nothing new,
+    // return [] to tell the app pagination is finished.
+    const mergeOn = Boolean(storage.get('mergeSeries'));
+    const fresh = items.filter(item => {
+      const key = mergeOn ? this.toSeriesKey(item.name || '') : item.path;
+      if (!key || this.searchSeen.has(key)) return false;
+      this.searchSeen.add(key);
+      return true;
+    });
+
+    return fresh.length ? fresh : [];
   }
 
   resolveUrl = (path: string, isNovel?: boolean) => {
-    if (isNovel) {
-      return `${this.site}/novel?id=${encodeURIComponent(
-        this.extractNovelId(path),
-      )}`;
-    }
 
     const { novelId, chapterNumber } = this.parseChapterPath(path);
     return `${this.site}/reader?novel=${encodeURIComponent(
