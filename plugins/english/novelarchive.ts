@@ -98,7 +98,7 @@ class NovelArchivePlugin implements Plugin.PluginBase {
   name = 'Novel Archive';
   icon = 'src/en/novelarchive/icon.png';
   site = 'https://novelarchive.cc';
-  version = '1.1.17';
+  version = '1.1.18';
   pluginSettings = {
     mergeSeries: {
       label: 'Merge volume variants into one series',
@@ -226,28 +226,43 @@ class NovelArchivePlugin implements Plugin.PluginBase {
             this.mergeSearchToken(source.title),
             this.baseTitle(source.title),
           ].filter(Boolean);
+          // Discover volumes along with their titles so we can sort by volume
+          // number; the API returns results in relevance order, not vol order.
+          type Disc = { id: string; title: string };
           const results = await Promise.all(
             queries.map(q =>
               this.apiGet<NovelsResponse>(
                 `/api/novels?search=${encodeURIComponent(q)}&per_page=50&fuzzy=${
                   fuzzyEnabled ? '1' : '0'
                 }`,
-              ).catch(() => ({ novels: [] as NovelArchiveNovel[] })),
+              )
+                .then(r =>
+                  (r.novels || []).map<Disc>(n => ({
+                    id: String(n.id),
+                    title: n.title,
+                  })),
+                )
+                .catch(() => [] as Disc[]),
             ),
           );
           const seen = new Set<string>();
-          const collected: string[] = [];
-          for (const r of results) {
-            for (const n of r.novels || []) {
+          const collected: Disc[] = [];
+          for (const list of results) {
+            for (const n of list) {
               if (this.toSeriesKey(n.title) !== key) continue;
-              const vid = String(n.id);
-              if (vid && !seen.has(vid)) {
-                seen.add(vid);
-                collected.push(vid);
+              // Skip bundle/mashup entries with a vol-range like "Vol 1-17";
+              // they carry mangled chapter lists, not a true volume.
+              if (/vol\.?\s*\d+\s*-\s*\d+/i.test(n.title)) continue;
+              if (n.id && !seen.has(n.id)) {
+                seen.add(n.id);
+                collected.push(n);
               }
             }
           }
-          ids = collected.slice(0, 30);
+          collected.sort(
+            (a, b) => this.volumeNumber(a.title) - this.volumeNumber(b.title),
+          );
+          ids = collected.map(n => n.id).slice(0, 30);
           this.seriesVolumes.set(key, ids);
         }
 
@@ -256,17 +271,21 @@ class NovelArchivePlugin implements Plugin.PluginBase {
         const settled = await Promise.allSettled(
           ids.map(vid => this.fetchVolumeChapters(vid)),
         );
-        const seenCh = new Set<number>();
+        // Concatenate every volume's chapters in volume order and renumber
+        // sequentially across the whole series. Each volume restarts at
+        // "Chapter 1", so deduping by chapter number would collapse every
+        // volume's Chapter 1 into one and drop the rest. Instead we keep each
+        // chapter's real path (volumeId/origNumber) so content still resolves
+        // from the correct volume, and assign a stable 1..N display number.
         const merged: Plugin.ChapterItem[] = [];
+        let seq = 0;
         for (const s of settled) {
           if (s.status !== 'fulfilled') continue;
           for (const ch of s.value) {
-            if (seenCh.has(ch.chapterNumber)) continue;
-            seenCh.add(ch.chapterNumber);
-            merged.push(ch);
+            seq += 1;
+            merged.push({ ...ch, chapterNumber: seq });
           }
         }
-        merged.sort((a, b) => a.chapterNumber - b.chapterNumber);
         if (merged.length) novel.chapters = merged;
       } catch {
         // Fall back to the single volume's chapters if discovery fails.
@@ -284,13 +303,25 @@ class NovelArchivePlugin implements Plugin.PluginBase {
     const TIMEOUT_MS = 8000;
     const timed = Promise.race([
       this.apiGet<NovelResponse>(`/api/novels/${encodeURIComponent(volumeId)}`),
-      new Promise<NovelResponse>((resolve) => setTimeout(resolve, TIMEOUT_MS)),
+      new Promise<NovelResponse>(resolve => setTimeout(() => resolve((undefined as unknown) as NovelResponse), TIMEOUT_MS)),
     ]);
     const response = await timed;
     const novel = response?.novel;
     if (!novel) return [];
-    // Path encodes the volume id so parseChapter resolves the right chapter.
-    return this.toChapters(volumeId, novel);
+    const chapters = this.toChapters(volumeId, novel);
+    // Prefix each chapter's display name with its volume number so a merged
+    // multi-volume list reads as one continuous series instead of seventeen
+    // identical "Chapter 1" rows. The path (volumeId/origNumber) is untouched
+    // so parseChapter still resolves content from the correct volume.
+    const vol = this.volumeNumber(novel.title);
+    if (vol > 0) {
+      const re = /^chapter\s*(\d+)/i;
+      for (const ch of chapters) {
+        if (!re.test(ch.name)) continue;
+        ch.name = `Vol. ${vol} Ch. ${ch.name.replace(re, '$1').trim()}`;
+      }
+    }
+    return chapters;
   }
 
   async parseChapter(chapterPath: string): Promise<string> {
