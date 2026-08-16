@@ -45,12 +45,11 @@ manifest and offers the update. No need to remove and re-add the repository.
   place. A banner in the summary (`[N volumes merged — M chapters total]`)
   confirms it happened.
 - **Skip unavailable chapters**: some chapters are listed but have no text on
-  the source (the API returns 404). Two modes, via the **Skip unavailable
-  chapters (scan & renumber)** setting:
-  - *Off (default)*: unavailable chapters stay listed; opening one silently
-    forwards to the next available chapter so reading keeps flowing.
-  - *On*: at novel-open the plugin probes every chapter in parallel, drops the
-    ones with no text, and renumbers the survivors `1..N` so the list is gap-free.
+  the source (the API returns 404). The plugin **always** scans every chapter
+  on novel open, drops the unavailable ones, and renumbers the survivors `1..N`
+  so the chapter list is gap-free. This runs once; the app caches the filtered
+  list. (Note: LNReader's mobile app does not expose a per-plugin settings UI,
+  so this behavior is not user-configurable.)
 - **Novel details**: cover, author, genres, status, summary, and the full chapter
   list.
 

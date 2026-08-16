@@ -102,7 +102,7 @@ const CHAPTER_NAME_RE = /^chapter\s*(\d+)/i;
 
 class NovelArchivePlugin implements Plugin.PluginBase {
   id = 'novelarchive';
-  version = '1.1.21';
+  version = '1.1.22';
   icon = 'src/en/novelarchive/icon.png';
   site = 'https://novelarchive.cc';
   pluginSettings = {
@@ -115,11 +115,6 @@ class NovelArchivePlugin implements Plugin.PluginBase {
       label: 'Fuzzy search',
       type: 'Switch',
       value: true,
-    },
-    skipUnavailable: {
-      label: 'Skip unavailable chapters (scan & renumber)',
-      type: 'Switch',
-      value: false,
     },
   };
   filters = {
@@ -324,13 +319,9 @@ class NovelArchivePlugin implements Plugin.PluginBase {
       }
     }
 
-    // Eager "skip unavailable": probe every chapter in parallel, drop the ones
-    // that 404 on the source (no content), and renumber survivors 1..N. Runs
-    // once; the app caches the filtered list. Disabled by default (lazy
-    // auto-forward handles 404s on read instead).
-    if (storage.get('skipUnavailable')) {
-      novel.chapters = await this.filterUnavailableChapters(novel.chapters);
-    }
+    // Scan every chapter, drop unavailable (404), renumber 1..N.
+    // Runs once; app caches the filtered list.
+    novel.chapters = await this.filterUnavailableChapters(novel.chapters);
 
     return novel;
   }
@@ -450,38 +441,20 @@ class NovelArchivePlugin implements Plugin.PluginBase {
 
   async parseChapter(chapterPath: string): Promise<string> {
     const { novelId, chapterNumber } = this.parseChapterPath(chapterPath);
-    const num = Number(chapterNumber);
+    const response = await this.apiGet<ChapterResponse>(
+      `/api/novels/${encodeURIComponent(novelId)}/chapters/${encodeURIComponent(
+        chapterNumber,
+      )}`,
+    );
+    const content = response.chapter?.content;
 
-    const fetchContent = async (n: number): Promise<string | undefined> => {
-      try {
-        const response = await this.apiGet<ChapterResponse>(
-          `/api/novels/${encodeURIComponent(novelId)}/chapters/${encodeURIComponent(
-            String(n),
-          )}`,
-        );
-        return response.chapter?.content;
-      } catch {
-        return undefined;
-      }
-    };
-
-    const content = await fetchContent(num);
-    if (content) return this.toChapterHtml(content);
-
-    // The requested chapter is unavailable (404 on the source, e.g. Konosuba
-    // Vol.1 Ch.2 has no text). When the eager "skip unavailable" setting is
-    // OFF we still don't want a hard error -- auto-forward to the next
-    // available chapter so the reader keeps flowing. If it's ON, the list was
-    // already filtered at parseNovel, so a 404 here is unexpected -> error.
-    if (storage.get('skipUnavailable')) {
+    if (!content) {
+      // Should not happen for chapters in the filtered list (parseNovel scans
+      // and drops 404s), but if the source changed, fail clearly.
       throw new Error(`NovelArchive chapter not found: ${chapterPath}`);
     }
 
-    for (let n = num + 1; n <= num + 5; n++) {
-      const next = await fetchContent(n);
-      if (next) return this.toChapterHtml(next);
-    }
-    throw new Error(`NovelArchive chapter not found: ${chapterPath}`);
+    return this.toChapterHtml(content);
   }
 
   async searchNovels(
