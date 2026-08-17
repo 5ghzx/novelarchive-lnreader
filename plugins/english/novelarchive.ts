@@ -102,7 +102,7 @@ const CHAPTER_NAME_RE = /^chapter\s*(\d+)/i;
 
 class NovelArchivePlugin implements Plugin.PluginBase {
   id = 'novelarchive';
-  version = '1.1.22';
+  version = '1.1.23';
   icon = 'src/en/novelarchive/icon.png';
   site = 'https://novelarchive.cc';
   pluginSettings = {
@@ -302,6 +302,11 @@ class NovelArchivePlugin implements Plugin.PluginBase {
           for (const ch of s.value) {
             seq += 1;
             merged.push({ ...ch, chapterNumber: seq });
+            // Update display name to use the new sequential number
+            // (path keeps volumeId/origNumber so content resolves correctly).
+            const volMatch = ch.name.match(/Volume\s+(\d+)/i);
+            const vol = volMatch ? volMatch[1] : '';
+            if (vol) ch.name = `Volume ${vol} Chapter ${seq}`;
           }
         }
         if (merged.length) {
@@ -354,8 +359,7 @@ class NovelArchivePlugin implements Plugin.PluginBase {
       const vol = this.volumeNumber(novel.title);
       if (vol > 0) {
         for (const ch of chapters) {
-          const match = ch.name.match(CHAPTER_NAME_RE);
-          if (match) ch.name = `Vol. ${vol} Ch. ${match[1]}`;
+          ch.name = `Volume ${vol} Chapter ${ch.chapterNumber}`;
         }
       }
       return chapters;
@@ -405,7 +409,17 @@ class NovelArchivePlugin implements Plugin.PluginBase {
     const kept = settled.filter(
       (c): c is Plugin.ChapterItem => c !== null,
     );
-    return kept.map((ch, n) => ({ ...ch, chapterNumber: n + 1 }));
+    return kept.map((ch, n) => {
+      const newNum = n + 1;
+      // Update display name to match new sequential number
+      const volMatch = ch.name.match(/Volume\s+(\d+)/i);
+      const vol = volMatch ? volMatch[1] : '';
+      return {
+        ...ch,
+        chapterNumber: newNum,
+        name: vol ? `Volume ${vol} Chapter ${newNum}` : ch.name,
+      };
+    });
   }
 
   // Run async tasks with a bounded concurrency limit, preserving input order.
