@@ -1,22 +1,30 @@
 import { minify_sync } from 'terser';
 import fs from 'fs';
-const plugin = '.js/plugins/english/novelarchive.js';
-const code = fs.readFileSync(plugin, 'utf-8');
-const result = minify_sync(code, {
-  compress: { arrows: false },
-  mangle: {},
-  ecma: 5,
-  enclose: false,
-  module: true,
-  toplevel: true,
-});
-if (result.error) {
-  console.error(result.error);
-  process.exit(1);
+
+function buildPlugin(name) {
+  const plugin = `.js/plugins/english/${name}.js`;
+  const code = fs.readFileSync(plugin, 'utf-8');
+  const result = minify_sync(code, {
+    compress: { arrows: false },
+    mangle: {},
+    ecma: 5,
+    enclose: false,
+    module: true,
+    toplevel: true,
+  });
+  if (result.error) {
+    console.error(result.error);
+    process.exit(1);
+  }
+  const outDir = `.js/src/plugins/english`;
+  fs.mkdirSync(outDir, { recursive: true });
+  fs.writeFileSync(`${outDir}/${name}.js`, result.code);
+  return { name, code: result.code };
 }
-const outDir = '.js/src/plugins/english';
-fs.mkdirSync(outDir, { recursive: true });
-fs.writeFileSync(`${outDir}/novelarchive.js`, result.code);
+
+buildPlugin('novelarchive');
+buildPlugin('lnori.com');
+
 const USERNAME = '5ghzx';
 const REPO = 'novelarchive-lnreader';
 const BRANCH = 'main';
@@ -24,23 +32,15 @@ const USER_CONTENT_LINK = `https://raw.githubusercontent.com/${USERNAME}/${REPO}
 const STATIC_LINK = `${USER_CONTENT_LINK}/public/static`;
 const PLUGIN_LINK = `${USER_CONTENT_LINK}/.js/src/plugins`;
 
-// Single source of truth: read the version the plugin was compiled with so the
-// manifest can never drift from the plugin's own version field.
-const versionMatch = code.match(/version\s*=\s*['"]([^'"]+)['"]/);
-if (!versionMatch) {
-  console.error('Could not find version field in compiled plugin');
-  process.exit(1);
+function getVersion(name) {
+  const code = fs.readFileSync(`.js/src/plugins/english/${name}.js`, 'utf-8');
+  const match = code.match(/version\s*=\s*['"]([^'"]+)['"]/);
+  if (!match) {
+    console.error(`Could not find version field in ${name}`);
+    process.exit(1);
+  }
+  return match[1];
 }
-const VERSION = versionMatch[1];
-
-const AI_NOTE =
-  'AI-generated plugin. The author notes: "I understand that AI generated ' +
-  'software has a reputation for being of poor quality, but I am certain this ' +
-  'task was simple enough for AI to handle while I focused on other things ' +
-  'like reading and enjoying."';
-// NOTE: the AI note is surfaced in README.md (where the repo is shared), not in
-// the manifest. The official manifest schema has no `description` key, and extra
-// keys risk strict parsers — so we keep the manifest standards-clean.
 
 const manifest = [
   {
@@ -48,12 +48,20 @@ const manifest = [
     name: 'Novel Archive',
     site: 'https://novelarchive.cc',
     lang: 'English',
-    version: VERSION,
+    version: getVersion('novelarchive'),
     url: `${PLUGIN_LINK}/english/novelarchive.js`,
     iconUrl: `${STATIC_LINK}/src/en/novelarchive/icon.png`,
+  },
+  {
+    id: 'lnori-com',
+    name: 'LNORI.com',
+    site: 'https://lnori.com/',
+    lang: 'English',
+    version: getVersion('lnori.com'),
+    url: `${PLUGIN_LINK}/english/lnori.com.js`,
+    iconUrl: `${STATIC_LINK}/src/en/lnori/icon.png`,
   },
 ];
 fs.mkdirSync('.dist', { recursive: true });
 fs.writeFileSync('.dist/plugins.min.json', JSON.stringify(manifest));
-console.log('minified bytes', result.code.length);
-console.log(JSON.stringify(manifest, null, 2));
+console.log('Manifest written:', JSON.stringify(manifest, null, 2));
