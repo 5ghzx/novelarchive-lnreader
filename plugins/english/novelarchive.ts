@@ -102,7 +102,7 @@ const CHAPTER_NAME_RE = /^chapter\s*(\d+)/i;
 
 class NovelArchivePlugin implements Plugin.PluginBase {
   id = 'novelarchive';
-  version = '1.1.23';
+  version = '1.1.24';
   icon = 'src/en/novelarchive/icon.png';
   site = 'https://novelarchive.cc';
   pluginSettings = {
@@ -328,6 +328,11 @@ class NovelArchivePlugin implements Plugin.PluginBase {
     // Runs once; app caches the filtered list.
     novel.chapters = await this.filterUnavailableChapters(novel.chapters);
 
+    // Optional: merge each volume's chapters into one mega chapter
+    if (storage.get('mergeVolumesToMega')) {
+      novel.chapters = await this.mergeVolumesToMegaChapters(novel.chapters);
+    }
+
     return novel;
   }
 
@@ -422,6 +427,75 @@ class NovelArchivePlugin implements Plugin.PluginBase {
     });
   }
 
+  // Merge each volume's chapters into one mega chapter per volume.
+  // Input chapters must have names like "Volume N Chapter X" and paths "volId/origNum".
+  // Output: 1 chapter per volume with path "volId/M", name "Volume N (Full)",
+  // containing concatenated HTML of all that volume's chapters.
+  private async mergeVolumesToMegaChapters(
+    chapters: Plugin.ChapterItem[],
+  ): Promise<Plugin.ChapterItem[]> {
+    if (!chapters.length) return chapters;
+
+    // Group by volume number from display name
+    const byVolume = new Map<string, Plugin.ChapterItem[]>();
+    for (const ch of chapters) {
+      const match = ch.name.match(/Volume\s+(\d+)/i);
+      const vol = match ? match[1] : '0';
+      if (!byVolume.has(vol)) byVolume.set(vol, []);
+      byVolume.get(vol)!.push(ch);
+    }
+
+    // Sort volumes numerically
+    const sortedVols = Array.from(byVolume.keys()).sort((a, b) => Number(a) - Number(b));
+
+    // Create mega chapters
+    const mega: Plugin.ChapterItem[] = [];
+    for (const vol of sortedVols) {
+      const volChapters = byVolume.get(vol)!;
+      const first = volChapters[0];
+      const volumeId = first.path.split('/')[0];
+      mega.push({
+        name: `Volume ${vol} (Full)`,
+        path: `${volumeId}/M`,
+        chapterNumber: mega.length + 1,
+      });
+    }
+    return mega;
+  }
+
+  // Fetch and concatenate all chapters of a volume into one HTML string.
+  private async fetchAndConcatVolumeChapters(volumeId: string): Promise<string> {
+    // Re-fetch the volume detail to get all chapter names/numbers
+    const response = await this.apiGet<NovelResponse>(
+      `/api/novels/${encodeURIComponent(volumeId)}`,
+    );
+    const novel = response?.novel;
+    if (!novel) throw new Error(`Volume not found: ${volumeId}`);
+
+    const chapters = this.toChapters(volumeId, novel);
+    const htmlParts: string[] = [];
+
+    // Fetch each chapter in sequence and concat
+    for (const ch of chapters) {
+      try {
+        const resp = await this.apiGet<ChapterResponse>(
+          `/api/novels/${encodeURIComponent(volumeId)}/chapters/${encodeURIComponent(
+            String(ch.chapterNumber),
+          )}`,
+        );
+        const content = resp.chapter?.content;
+        if (content) {
+          const html = this.toChapterHtml(content);
+          // Add chapter header
+          htmlParts.push(`<h2>${ch.name}</h2>\n${html}`);
+        }
+      } catch {
+        // Skip failed chapters silently
+      }
+    }
+
+    return htmlParts.join('\n<hr/>\n');
+  }
   // Run async tasks with a bounded concurrency limit, preserving input order.
   private async runWithConcurrency<T>(
     tasks: Promise<T>[],
@@ -454,6 +528,12 @@ class NovelArchivePlugin implements Plugin.PluginBase {
   }
 
   async parseChapter(chapterPath: string): Promise<string> {
+    // Mega chapter path format: "volumeId/M" (M = mega)
+    if (chapterPath.endsWith('/M')) {
+      const volumeId = chapterPath.slice(0, -2);
+      return this.fetchAndConcatVolumeChapters(volumeId);
+    }
+
     const { novelId, chapterNumber } = this.parseChapterPath(chapterPath);
     const response = await this.apiGet<ChapterResponse>(
       `/api/novels/${encodeURIComponent(novelId)}/chapters/${encodeURIComponent(
@@ -463,8 +543,6 @@ class NovelArchivePlugin implements Plugin.PluginBase {
     const content = response.chapter?.content;
 
     if (!content) {
-      // Should not happen for chapters in the filtered list (parseNovel scans
-      // and drops 404s), but if the source changed, fail clearly.
       throw new Error(`NovelArchive chapter not found: ${chapterPath}`);
     }
 
