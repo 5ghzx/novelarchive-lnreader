@@ -102,12 +102,22 @@ const CHAPTER_NAME_RE = /^chapter\s*(\d+)/i;
 
 class NovelArchivePlugin implements Plugin.PluginBase {
   id = 'novelarchive';
-  version = '1.1.24';
+  version = '1.1.25';
   icon = 'src/en/novelarchive/icon.png';
   site = 'https://novelarchive.cc';
   pluginSettings = {
     mergeSeries: {
-      label: 'Merge volume variants into one series',
+      label: 'Merge all volumes into one series',
+      type: 'Switch',
+      value: false,
+    },
+    skipUnavailable: {
+      label: 'Skip empty chapters (drop & renumber)',
+      type: 'Switch',
+      value: true,
+    },
+    mergeVolumesToMega: {
+      label: 'Merge chapters into volume mega-chapters',
       type: 'Switch',
       value: false,
     },
@@ -226,15 +236,15 @@ class NovelArchivePlugin implements Plugin.PluginBase {
     // numbered across the whole series (Vol 3 starts at Chapter 8), not 1..N
     // per volume. So a naive collapse just hides the other volumes. When merge
     // is on, rediscover every sibling volume via search and concatenate all
+    // STEP 1: Drop empty (404) chapters from this base volume and renumber.
+    // Always on — a 404 chapter is unusable, so it never belongs in the list.
+    novel.chapters = await this.filterUnavailableChapters(novel.chapters);
+
+    // STEP 2: Merge sibling volumes into one series (if enabled).
     if (storage.get('mergeSeries')) {
       try {
         const key = this.toSeriesKey(source.title);
-        // Cached discovery: avoids re-searching the API on every open / library
-        // refresh. The API has no series endpoint, so we find sibling volumes
-        // by searching (short token + full base title) and keeping matches.
         let ids = this.seriesVolumes.get(key);
-        // Volume count for the merge-progress banner (hoisted so it's in scope
-        // whether we just discovered the volumes or used the cache).
         let volCount = 0;
         if (!ids) {
           const fuzzyEnabled = storage.get('fuzzySearch') ?? true;
@@ -242,8 +252,6 @@ class NovelArchivePlugin implements Plugin.PluginBase {
             this.mergeSearchToken(source.title),
             this.baseTitle(source.title),
           ].filter(Boolean);
-          // Discover volumes along with their titles so we can sort by volume
-          // number; the API returns results in relevance order, not vol order.
           const results = await Promise.all(
             queries.map(q =>
               this.apiGet<NovelsResponse>(
@@ -265,8 +273,6 @@ class NovelArchivePlugin implements Plugin.PluginBase {
           for (const list of results) {
             for (const n of list) {
               if (this.toSeriesKey(n.title) !== key) continue;
-              // Skip bundle/mashup entries with a vol-range like "Vol 1-17";
-              // they carry mangled chapter lists, not a true volume.
               if (/vol\.?\s*\d+\s*-\s*\d+/i.test(n.title)) continue;
               if (n.id && !seen.has(n.id)) {
                 seen.add(n.id);
@@ -284,17 +290,9 @@ class NovelArchivePlugin implements Plugin.PluginBase {
           volCount = ids.length;
         }
 
-        // Fetch every volume's chapters in parallel; a slow/empty volume must
-        // not stall the whole novel (no infinite "loading").
         const settled = await Promise.allSettled(
           ids.map(vid => this.fetchVolumeChapters(vid)),
         );
-        // Concatenate every volume's chapters in volume order and renumber
-        // sequentially across the whole series. Each volume restarts at
-        // "Chapter 1", so deduping by chapter number would collapse every
-        // volume's Chapter 1 into one and drop the rest. Instead we keep each
-        // chapter's real path (volumeId/origNumber) so content still resolves
-        // from the correct volume, and assign a stable 1..N display number.
         const merged: Plugin.ChapterItem[] = [];
         let seq = 0;
         for (const s of settled) {
@@ -302,8 +300,6 @@ class NovelArchivePlugin implements Plugin.PluginBase {
           for (const ch of s.value) {
             seq += 1;
             merged.push({ ...ch, chapterNumber: seq });
-            // Update display name to use the new sequential number
-            // (path keeps volumeId/origNumber so content resolves correctly).
             const volMatch = ch.name.match(/Volume\s+(\d+)/i);
             const vol = volMatch ? volMatch[1] : '';
             if (vol) ch.name = `Volume ${vol} Chapter ${seq}`;
@@ -311,24 +307,17 @@ class NovelArchivePlugin implements Plugin.PluginBase {
         }
         if (merged.length) {
           novel.chapters = merged;
-          // Surface the merge in the UI: the app's novel-detail screen renders
-          // `summary`, so a one-line banner confirms merge ran and how many
-          // volumes/chapters were assembled. There is no plugin progress
-          // callback during parseNovel, so this indicator appears once the
-          // detail loads.
-          const banner = `[${volCount} volumes merged — ${merged.length} chapters total]\n`;
+          // After merge, drop empty chapters from the merged list too.
+          novel.chapters = await this.filterUnavailableChapters(novel.chapters);
+          const banner = `[${volCount} volumes merged — ${novel.chapters.length} chapters total]\n`;
           novel.summary = novel.summary ? banner + novel.summary : banner;
         }
       } catch {
-        // Fall back to the single volume's chapters if discovery fails.
+        // Fall back to the single-volume (already filtered) chapters.
       }
     }
 
-    // Scan every chapter, drop unavailable (404), renumber 1..N.
-    // Runs once; app caches the filtered list.
-    novel.chapters = await this.filterUnavailableChapters(novel.chapters);
-
-    // Optional: merge each volume's chapters into one mega chapter
+    // STEP 3: Merge each volume's chapters into one mega-chapter (if enabled).
     if (storage.get('mergeVolumesToMega')) {
       novel.chapters = await this.mergeVolumesToMegaChapters(novel.chapters);
     }
