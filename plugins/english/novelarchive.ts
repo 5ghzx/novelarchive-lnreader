@@ -102,7 +102,7 @@ const CHAPTER_NAME_RE = /^chapter\s*(\d+)/i;
 
 class NovelArchivePlugin implements Plugin.PluginBase {
   id = 'novelarchive';
-  version = '1.1.25';
+  version = '1.1.26';
   icon = 'src/en/novelarchive/icon.png';
   site = 'https://novelarchive.cc';
   pluginSettings = {
@@ -192,6 +192,13 @@ class NovelArchivePlugin implements Plugin.PluginBase {
   // availability probes run in parallel. NovelArchive (Cloudflare) showed no
   // rate limiting at 150 parallel requests; 64 keeps the burst polite.
   private static readonly SKIP_CONCURRENCY = 64;
+  // Cache of mega-chapter path -> cleaned, renumbered chapter list, populated
+  // when mergeVolumesToMegaChapters builds the mega entries and consumed by
+  // parseChapter when the user opens a "Volume N (Full)" entry.
+  private megaChapterCache = new Map<string, Plugin.ChapterItem[]>();
+  // Source title of the novel currently being parsed (used by the mega builder
+  // to infer a single-volume novel's volume number when names lack a prefix).
+  private lastSourceTitle = '';
 
   async popularNovels(
     pageNo: number,
@@ -212,6 +219,7 @@ class NovelArchivePlugin implements Plugin.PluginBase {
       `/api/novels/${encodeURIComponent(id)}`,
     );
     const source = response.novel;
+    this.lastSourceTitle = source.title || '';
 
     if (!source) {
       throw new Error(`NovelArchive novel not found: ${id}`);
@@ -425,19 +433,36 @@ class NovelArchivePlugin implements Plugin.PluginBase {
   ): Promise<Plugin.ChapterItem[]> {
     if (!chapters.length) return chapters;
 
-    // Group by volume number from display name
+    // Drop empty (404) chapters FIRST and renumber, so a skipped chapter like
+    // Konosuba's empty Ch.2 never leaves a missing "Chapter 2" heading in the
+    // mega content. The name carries the volume prefix ("Volume N Chapter X")
+    // for merged series; for a single-volume novel the chapters have no prefix
+    // yet, so infer the volume number from the source title below.
+    const cleaned = await this.filterUnavailableChapters(chapters);
+
+    // Group by volume number from display name; fall back to the source
+    // novel's own volume number when chapters aren't prefixed (single-volume
+    // path with merge off).
     const byVolume = new Map<string, Plugin.ChapterItem[]>();
-    for (const ch of chapters) {
+    for (const ch of cleaned) {
       const match = ch.name.match(/Volume\s+(\d+)/i);
-      const vol = match ? match[1] : '0';
+      let vol = match ? match[1] : '0';
+      if (vol === '0') {
+        const v = this.volumeNumber(this.lastSourceTitle);
+        vol = v > 0 ? String(v) : '1';
+      }
       if (!byVolume.has(vol)) byVolume.set(vol, []);
       byVolume.get(vol)!.push(ch);
     }
 
     // Sort volumes numerically
-    const sortedVols = Array.from(byVolume.keys()).sort((a, b) => Number(a) - Number(b));
+    const sortedVols = Array.from(byVolume.keys()).sort(
+      (a, b) => Number(a) - Number(b),
+    );
 
-    // Create mega chapters
+    // Create one mega chapter per (non-empty) volume, each carrying the
+    // already-cleaned, renumbered chapter list so its content build skips
+    // empties and emits sequential headers.
     const mega: Plugin.ChapterItem[] = [];
     for (const vol of sortedVols) {
       const volChapters = byVolume.get(vol)!;
@@ -448,41 +473,42 @@ class NovelArchivePlugin implements Plugin.PluginBase {
         path: `${volumeId}/M`,
         chapterNumber: mega.length + 1,
       });
+      // Cache the cleaned chapter list for this mega entry so parseChapter can
+      // build its content without a second re-fetch (and without re-including
+      // the 404 chapters we just dropped).
+      this.megaChapterCache.set(`${volumeId}/M`, volChapters);
     }
     return mega;
   }
 
-  // Fetch and concatenate all chapters of a volume into one HTML string.
-  private async fetchAndConcatVolumeChapters(volumeId: string): Promise<string> {
-    // Re-fetch the volume detail to get all chapter names/numbers
-    const response = await this.apiGet<NovelResponse>(
-      `/api/novels/${encodeURIComponent(volumeId)}`,
-    );
-    const novel = response?.novel;
-    if (!novel) throw new Error(`Volume not found: ${volumeId}`);
-
-    const chapters = this.toChapters(volumeId, novel);
+  // Build the concatenated HTML for a mega chapter from an already
+  // empty-dropped, renumbered chapter list. We do NOT re-fetch the raw volume
+  // list here, because that would re-include the 404 chapters we already
+  // dropped — exactly the "missing Chapter 2 heading" bug. Each entry's path
+  // is "volumeId/origNum", so we fetch just its content; a 404 is skipped and
+  // the sequential numbering (already in ch.name) is preserved as headers.
+  private async fetchAndConcatVolumeChapters(
+    volumeId: string,
+    chapters: Plugin.ChapterItem[],
+  ): Promise<string> {
     const htmlParts: string[] = [];
-
-    // Fetch each chapter in sequence and concat
     for (const ch of chapters) {
+      const [, num] = ch.path.split('/');
       try {
         const resp = await this.apiGet<ChapterResponse>(
           `/api/novels/${encodeURIComponent(volumeId)}/chapters/${encodeURIComponent(
-            String(ch.chapterNumber),
+            String(num),
           )}`,
         );
         const content = resp.chapter?.content;
         if (content) {
-          const html = this.toChapterHtml(content);
-          // Add chapter header
-          htmlParts.push(`<h2>${ch.name}</h2>\n${html}`);
+          htmlParts.push(`<h2>${ch.name}</h2>\n${this.toChapterHtml(content)}`);
         }
       } catch {
-        // Skip failed chapters silently
+        // Skip failed chapters silently (already excluded by the eager scan,
+        // but guard against a late 404 here too).
       }
     }
-
     return htmlParts.join('\n<hr/>\n');
   }
   // Run async tasks with a bounded concurrency limit, preserving input order.
@@ -490,7 +516,10 @@ class NovelArchivePlugin implements Plugin.PluginBase {
     tasks: Promise<T>[],
     limit: number,
   ): Promise<T[]> {
-    const { promise, resolve } = Promise.withResolvers<T[]>();
+    let resolve!: (v: T[]) => void;
+    const promise = new Promise<T[]>(res => {
+      resolve = res;
+    });
     const results: T[] = new Array(tasks.length);
     let active = 0;
     let cursor = 0;
@@ -517,13 +546,13 @@ class NovelArchivePlugin implements Plugin.PluginBase {
   }
 
   async parseChapter(chapterPath: string): Promise<string> {
-    // Mega chapter path format: "volumeId/M" (M = mega)
+    // Mega chapter path format: "volumeId/M" (M = mega). The cleaned,
+    // renumbered chapter list was stashed in megaChapterCache at build time.
     if (chapterPath.endsWith('/M')) {
       const volumeId = chapterPath.slice(0, -2);
-      return this.fetchAndConcatVolumeChapters(volumeId);
+      const chapters = this.megaChapterCache.get(chapterPath) ?? [];
+      return this.fetchAndConcatVolumeChapters(volumeId, chapters);
     }
-
-    const { novelId, chapterNumber } = this.parseChapterPath(chapterPath);
     const response = await this.apiGet<ChapterResponse>(
       `/api/novels/${encodeURIComponent(novelId)}/chapters/${encodeURIComponent(
         chapterNumber,

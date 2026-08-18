@@ -9,7 +9,16 @@ class LnoriComPlugin implements Plugin.PluginBase {
   name = 'LNORI.com';
   icon = 'src/en/lnori/icon.png';
   site = 'https://lnori.com/';
-  version = '1.0.0';
+  version = '1.0.1';
+
+  // Cached library so the app's infinite-scroll Browse doesn't re-download the
+  // full 1.8MB / 884-card library page on every page request (that's what made
+  // the main page hang / load "infinitely"). Fetched once, then paginated from
+  // memory. The cache is cleared on app restart; a manual pull-to-refresh is
+  // unnecessary because the library list itself isn't user-specific.
+  private libraryCache:
+    | { items: { novel: Plugin.NovelItem; author: string; tags: string[] }[]; at: number }
+    | null = null;
 
   private async getLibraryNovels(): Promise<
     {
@@ -18,6 +27,7 @@ class LnoriComPlugin implements Plugin.PluginBase {
       tags: string[];
     }[]
   > {
+    if (this.libraryCache) return this.libraryCache.items;
     const url = this.site + 'library';
     const body = await fetchText(url);
     const $ = parseHTML(body);
@@ -55,6 +65,7 @@ class LnoriComPlugin implements Plugin.PluginBase {
       }
     });
 
+    this.libraryCache = { items: parsedList, at: Date.now() };
     return parsedList;
   }
 
@@ -78,6 +89,11 @@ class LnoriComPlugin implements Plugin.PluginBase {
     } else if (selectedSort === 'title-za') {
       filteredList.sort((a, b) => b.novel.name.localeCompare(a.novel.name));
     }
+
+    // Cap the browsable total so the app's infinite scroll terminates instead
+    // of paging through all ~884 titles (which felt like an endless spinner).
+    const MAX = 360;
+    if (filteredList.length > MAX) filteredList = filteredList.slice(0, MAX);
 
     const pageSize = 36;
     const offset = (pageNo - 1) * pageSize;
