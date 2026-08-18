@@ -1,4 +1,5 @@
 import { fetchText } from '@libs/fetch';
+import { storage } from '@libs/storage';
 import { Plugin } from '@/types/plugin';
 import { Filters, FilterTypes } from '@libs/filterInputs';
 import { load as parseHTML } from 'cheerio';
@@ -9,7 +10,15 @@ class LnoriComPlugin implements Plugin.PluginBase {
   name = 'LNORI.com';
   icon = 'src/en/lnori/icon.png';
   site = 'https://lnori.com/';
-  version = '1.0.1';
+  version = '1.0.2';
+  pluginSettings = {
+    mergeCoverTitle: {
+      label: 'Merge cover + title page into one entry',
+      type: 'Switch',
+      value: true,
+    },
+  };
+
 
   // Cached library so the app's infinite-scroll Browse doesn't re-download the
   // full 1.8MB / 884-card library page on every page request (that's what made
@@ -171,7 +180,7 @@ class LnoriComPlugin implements Plugin.PluginBase {
     };
 
     const volumeUrls = Object.keys(volumeMap);
-    const chapters: Plugin.ChapterItem[] = [];
+    let chapters: Plugin.ChapterItem[] = [];
 
     // Deliberately sequential. The official plugin uses Promise.all here,
     // causing every volume page to be fetched and parsed concurrently.
@@ -226,6 +235,34 @@ class LnoriComPlugin implements Plugin.PluginBase {
       chapters.push(...volChapters);
     }
 
+    // Toggle (default on): fold the "Cover" entry and the following "Title
+    // Page" entry into a single "Cover & Title Page" row. They're just image
+    // pages with no prose, so as separate TOC rows they're pure pollution.
+    if (storage.get('mergeCoverTitle') ?? true) {
+      const merged: Plugin.ChapterItem[] = [];
+      for (let i = 0; i < chapters.length; i++) {
+        const cur = chapters[i];
+        const next = chapters[i + 1];
+        const isCover = /cover/i.test(cur.name);
+        const nextIsTitle = next && /title\s*page/i.test(next.name);
+        if (isCover && nextIsTitle) {
+          // Keep the cover row, append the title-page anchor so parseChapter
+          // renders both images in one entry, then skip the title page.
+          const coverAnchor = cur.path.split('#')[1];
+          const titleAnchor = next.path.split('#')[1];
+          merged.push({
+            ...cur,
+            name: 'Cover & Title Page',
+            path: `${cur.path.split('#')[0]}#${coverAnchor},${titleAnchor}`,
+          });
+          i++; // consume the title page
+          continue;
+        }
+        merged.push(cur);
+      }
+      chapters = merged;
+    }
+
     novel.chapters = chapters.map((chap, idx) => ({
       ...chap,
       chapterNumber: idx + 1,
@@ -235,7 +272,10 @@ class LnoriComPlugin implements Plugin.PluginBase {
   }
 
   async parseChapter(chapterPath: string): Promise<string> {
-    const [pathWithoutAnchor, anchor] = chapterPath.split('#');
+    const [pathWithoutAnchor, anchorRaw] = chapterPath.split('#');
+    // A merged "Cover & Title Page" entry carries two anchors joined by comma
+    // ("page01,page02"); render each section and concatenate.
+    const anchors = (anchorRaw || '').split(',').filter(Boolean);
     const url = this.site.replace(/\/$/, '') + '/' + pathWithoutAnchor;
     const body = await fetchText(url);
     const $ = parseHTML(body);
@@ -246,6 +286,28 @@ class LnoriComPlugin implements Plugin.PluginBase {
       if (href) tocAnchors.push(href.substring(1));
     });
 
+    // Multi-anchor (merged cover+title): concatenate each section's content.
+    if (anchors.length > 1) {
+      const parts = anchors.map(a => {
+        const sel = a ? `section#${a}` : 'section.chapter';
+        const sec = $(sel);
+        if (!sec.length) return '';
+        const mc = sec.find('.main').length ? sec.find('.main').clone() : sec.clone();
+        mc.find('h2, h3, .chapter-title').remove();
+        mc.find('img').each((i, el) => {
+          const src = $(el).attr('src');
+          if (src && src.startsWith('/')) $(el).attr('src', this.site.replace(/\/$/, '') + src);
+        });
+        mc.find('source').each((i, el) => {
+          const srcset = $(el).attr('srcset');
+          if (srcset && srcset.startsWith('/')) $(el).attr('srcset', this.site.replace(/\/$/, '') + srcset);
+        });
+        return mc.html() || '';
+      });
+      return parts.filter(Boolean).join('\n');
+    }
+
+    const anchor = anchors[0] || '';
     const chapterSelector = anchor ? `section#${anchor}` : 'section.chapter';
     const section = $(chapterSelector);
     if (!section.length) {
