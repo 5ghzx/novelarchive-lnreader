@@ -10,7 +10,7 @@ class LnoriComPlugin implements Plugin.PluginBase {
   name = 'LNORI.com';
   icon = 'src/en/lnori/icon.png';
   site = 'https://lnori.com/';
-  version = '1.0.2';
+  version = '1.0.3';
   pluginSettings = {
     mergeCoverTitle: {
       label: 'Merge cover + title page into one entry',
@@ -18,6 +18,31 @@ class LnoriComPlugin implements Plugin.PluginBase {
       value: true,
     },
   };
+  // Browser-like headers so Cloudflare's JS bot-challenge (the embedded
+  // challenge-platform script) treats our requests like the webview, which
+  // already passes on the same device/network. The app's default fetchText
+  // sends an Android UA + Accept-Language:* + Sec-Fetch-Mode:cors, a
+  // fingerprint the challenge clears for a real browser but not for a raw
+  // client — that's why webview works and the plugin intermittently doesn't.
+  // We can't run the challenge JS, but matching a browser's header set lets
+  // already-cleared requests (and the webview's clearance cookie context)
+  // ride through instead of being challenged fresh.
+  private async fetchPage(url: string): Promise<string> {
+    return fetchText(url, {
+      headers: {
+        'User-Agent':
+          'Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36',
+        Accept:
+          'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Sec-Fetch-Mode': 'navigate',
+        'Sec-Fetch-Dest': 'document',
+        'Sec-Fetch-Site': 'same-origin',
+        Referer: this.site,
+      },
+    });
+  }
+
 
 
   // Cached library so the app's infinite-scroll Browse doesn't re-download the
@@ -38,7 +63,7 @@ class LnoriComPlugin implements Plugin.PluginBase {
   > {
     if (this.libraryCache) return this.libraryCache.items;
     const url = this.site + 'library';
-    const body = await fetchText(url);
+    const body = await this.fetchPage(url);
     const $ = parseHTML(body);
 
     const parsedList: {
@@ -111,7 +136,7 @@ class LnoriComPlugin implements Plugin.PluginBase {
 
   async parseNovel(novelPath: string): Promise<Plugin.SourceNovel> {
     const url = this.site + novelPath;
-    const body = await fetchText(url);
+    const body = await this.fetchPage(url);
     const $ = parseHTML(body);
 
     const novel: Plugin.SourceNovel = {
@@ -188,7 +213,7 @@ class LnoriComPlugin implements Plugin.PluginBase {
     // on low-power/e-ink Android devices.
     for (const volUrl of volumeUrls) {
       const fullVolUrl = this.site.replace(/\/$/, '') + volUrl;
-      const volHtml = await fetchText(fullVolUrl);
+      const volHtml = await this.fetchPage(fullVolUrl);
       const $vol = parseHTML(volHtml);
       const volChapters: Plugin.ChapterItem[] = [];
 
@@ -277,7 +302,7 @@ class LnoriComPlugin implements Plugin.PluginBase {
     // ("page01,page02"); render each section and concatenate.
     const anchors = (anchorRaw || '').split(',').filter(Boolean);
     const url = this.site.replace(/\/$/, '') + '/' + pathWithoutAnchor;
-    const body = await fetchText(url);
+    const body = await this.fetchPage(url);
     const $ = parseHTML(body);
 
     const tocAnchors: string[] = [];
