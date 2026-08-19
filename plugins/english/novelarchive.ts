@@ -102,7 +102,7 @@ const CHAPTER_NAME_RE = /^chapter\s*(\d+)/i;
 
 class NovelArchivePlugin implements Plugin.PluginBase {
   id = 'novelarchive';
-  version = '1.1.26';
+  version = '1.1.27';
   icon = 'src/en/novelarchive/icon.png';
   site = 'https://novelarchive.cc';
   pluginSettings = {
@@ -192,6 +192,11 @@ class NovelArchivePlugin implements Plugin.PluginBase {
   // availability probes run in parallel. NovelArchive (Cloudflare) showed no
   // rate limiting at 150 parallel requests; 64 keeps the burst polite.
   private static readonly SKIP_CONCURRENCY = 64;
+  // Per-chapter availability probe timeout (ms). A probe that exceeds this is
+  // treated as "keep" rather than hanging the whole parseNovel (which is what
+  // made "Merge volumes" spin forever — 318 chapter probes with no upper
+  // bound on a slow API). Bounded so the merge always finishes.
+  private static readonly PROBE_TIMEOUT_MS = 6000;
   // Cache of mega-chapter path -> cleaned, renumbered chapter list, populated
   // when mergeVolumesToMegaChapters builds the mega entries and consumed by
   // parseChapter when the user opens a "Volume N (Full)" entry.
@@ -315,9 +320,10 @@ class NovelArchivePlugin implements Plugin.PluginBase {
         }
         if (merged.length) {
           novel.chapters = merged;
-          // After merge, drop empty chapters from the merged list too.
-          novel.chapters = await this.filterUnavailableChapters(novel.chapters);
-          const banner = `[${volCount} volumes merged — ${novel.chapters.length} chapters total]\n`;
+          // The merged list is already empty-dropped: each volume was filtered
+          // inside fetchVolumeChapters. Re-scanning all ~318 chapters here was
+          // the cause of the "Merge volumes spins forever" regression.
+          const banner = `[${volCount} volumes merged — ${merged.length} chapters total]\n`;
           novel.summary = novel.summary ? banner + novel.summary : banner;
         }
       } catch {
@@ -353,6 +359,11 @@ class NovelArchivePlugin implements Plugin.PluginBase {
       const novel = response?.novel;
       if (!novel) return [];
       const chapters = this.toChapters(volumeId, novel);
+      // Drop empty (404) chapters for THIS volume now, so the merged list the
+      // caller concatenates is already clean — we must not re-scan all ~318
+      // merged chapters again (that second pass is what made "Merge volumes"
+      // spin forever). The probe is time-bounded so a slow API can't stall us.
+      const probed = await this.filterUnavailableChapters(chapters);
       // Prefix each chapter's display name with its volume number so a merged
       // multi-volume list reads as one continuous series instead of seventeen
       // identical "Chapter 1" rows. The path (volumeId/origNumber) is left
@@ -360,34 +371,37 @@ class NovelArchivePlugin implements Plugin.PluginBase {
       // actually owns the chapter.
       const vol = this.volumeNumber(novel.title);
       if (vol > 0) {
-        for (const ch of chapters) {
+        for (const ch of probed) {
           ch.name = `Volume ${vol} Chapter ${ch.chapterNumber}`;
         }
       }
-      return chapters;
+      return probed;
     } finally {
       if (timer) clearTimeout(timer);
     }
   }
-
-  // Probe a single chapter without downloading its body: true when the API
-  // responds with content (200), false on 404 / error. The eager "skip
-  // unavailable" scan uses this so we don't pull every chapter's text just to
-  // find which exist.
   private async probeChapterAvailable(
     novelId: string,
     chapterNumber: number,
   ): Promise<boolean> {
-    try {
-      const response = await this.apiGet<ChapterResponse>(
-        `/api/novels/${encodeURIComponent(novelId)}/chapters/${encodeURIComponent(
-          String(chapterNumber),
-        )}`,
-      );
-      return Boolean(response.chapter?.content);
-    } catch {
-      return false;
-    }
+    const request = (async () => {
+      try {
+        const response = await this.apiGet<ChapterResponse>(
+          `/api/novels/${encodeURIComponent(novelId)}/chapters/${encodeURIComponent(
+            String(chapterNumber),
+          )}`,
+        );
+        return Boolean(response.chapter?.content);
+      } catch {
+        return false;
+      }
+    })();
+    // Bound the probe so a slow/hanging API can't stall the merge. On timeout
+    // we return "keep" (don't drop an unverified chapter).
+    const timeout = new Promise<boolean>(resolve => {
+      setTimeout(() => resolve(true), NovelArchivePlugin.PROBE_TIMEOUT_MS);
+    });
+    return Promise.race([request, timeout]);
   }
 
   // Eager mode: probe every chapter in parallel (bounded by
