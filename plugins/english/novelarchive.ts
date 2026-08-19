@@ -102,7 +102,7 @@ const CHAPTER_NAME_RE = /^chapter\s*(\d+)/i;
 
 class NovelArchivePlugin implements Plugin.PluginBase {
   id = 'novelarchive';
-  version = '1.1.27';
+  version = '1.1.28';
   icon = 'src/en/novelarchive/icon.png';
   site = 'https://novelarchive.cc';
   pluginSettings = {
@@ -197,10 +197,6 @@ class NovelArchivePlugin implements Plugin.PluginBase {
   // made "Merge volumes" spin forever — 318 chapter probes with no upper
   // bound on a slow API). Bounded so the merge always finishes.
   private static readonly PROBE_TIMEOUT_MS = 6000;
-  // Cache of mega-chapter path -> cleaned, renumbered chapter list, populated
-  // when mergeVolumesToMegaChapters builds the mega entries and consumed by
-  // parseChapter when the user opens a "Volume N (Full)" entry.
-  private megaChapterCache = new Map<string, Plugin.ChapterItem[]>();
   // Source title of the novel currently being parsed (used by the mega builder
   // to infer a single-volume novel's volume number when names lack a prefix).
   private lastSourceTitle = '';
@@ -482,20 +478,21 @@ class NovelArchivePlugin implements Plugin.PluginBase {
       const volChapters = byVolume.get(vol)!;
       const first = volChapters[0];
       const volumeId = first.path.split('/')[0];
+      // Encode the volume number AND the cleaned chapter numbers into the
+      // path itself — NOT an in-memory cache. LNReader may re-instantiate the
+      // plugin between parseNovel and parseChapter, which would wipe an
+      // instance cache and leave every mega chapter empty. With the data in
+      // the path, parseChapter rebuilds content statelessly (and can label
+      // each <h2> as "Volume N Chapter X").
+      const nums = volChapters.map(c => c.path.split('/')[1]).join(',');
       mega.push({
         name: `Volume ${vol} (Full)`,
-        path: `${volumeId}/M`,
+        path: `${volumeId}/M/V${vol}/${nums}`,
         chapterNumber: mega.length + 1,
       });
-      // Cache the cleaned chapter list for this mega entry so parseChapter can
-      // build its content without a second re-fetch (and without re-including
-      // the 404 chapters we just dropped).
-      this.megaChapterCache.set(`${volumeId}/M`, volChapters);
     }
     return mega;
   }
-
-  // Build the concatenated HTML for a mega chapter from an already
   // empty-dropped, renumbered chapter list. We do NOT re-fetch the raw volume
   // list here, because that would re-include the 404 chapters we already
   // dropped — exactly the "missing Chapter 2 heading" bug. Each entry's path
@@ -560,13 +557,24 @@ class NovelArchivePlugin implements Plugin.PluginBase {
   }
 
   async parseChapter(chapterPath: string): Promise<string> {
-    // Mega chapter path format: "volumeId/M" (M = mega). The cleaned,
-    // renumbered chapter list was stashed in megaChapterCache at build time.
-    if (chapterPath.endsWith('/M')) {
-      const volumeId = chapterPath.slice(0, -2);
-      const chapters = this.megaChapterCache.get(chapterPath) ?? [];
+    // Mega chapter path format: "volumeId/M/num1,num2,..." (M = mega). The
+    // cleaned chapter numbers are encoded in the path so content builds
+    // statelessly (no instance cache that LNReader might wipe between
+    // parseNovel and parseChapter).
+    const m = chapterPath.match(/^(.+)\/M\/V(\d+)\/(.+)$/);
+    if (m) {
+      const volumeId = m[1];
+      const vol = m[2];
+      const nums = m[3].split(',').filter(Boolean);
+      const chapters = nums.map(num => ({
+        path: `${volumeId}/${num}`,
+        name: `Volume ${vol} Chapter ${num}`,
+      }));
       return this.fetchAndConcatVolumeChapters(volumeId, chapters);
     }
+    const [pathWithoutAnchor, anchor] = chapterPath.split('#');
+    const url = this.site.replace(/\/$/, '') + '/' + pathWithoutAnchor;
+    const { novelId, chapterNumber } = this.parseChapterPath(chapterPath);
     const response = await this.apiGet<ChapterResponse>(
       `/api/novels/${encodeURIComponent(novelId)}/chapters/${encodeURIComponent(
         chapterNumber,
