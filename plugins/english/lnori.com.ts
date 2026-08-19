@@ -10,7 +10,7 @@ class LnoriComPlugin implements Plugin.PluginBase {
   name = 'LNORI.com';
   icon = 'src/en/lnori/icon.png';
   site = 'https://lnori.com/';
-  version = '1.0.3';
+  version = '1.0.4';
   pluginSettings = {
     mergeCoverTitle: {
       label: 'Merge cover + title page into one entry',
@@ -27,8 +27,37 @@ class LnoriComPlugin implements Plugin.PluginBase {
   // We can't run the challenge JS, but matching a browser's header set lets
   // already-cleared requests (and the webview's clearance cookie context)
   // ride through instead of being challenged fresh.
+  // Detect a Cloudflare bot-challenge / block interstitial so we can surface a
+  // clear error instead of silently parsing a challenge shell as "0 chapters".
+  // Unambiguous markers only (`cf-mitigated` / "enable JavaScript and
+  // cookies" / "Attention Required"). "Just a moment" alone is rejected
+  // because the novel prose legitimately contains that phrase — we only treat
+  // it as a challenge when the page is tiny (real lnori pages are MB-scale,
+  // challenge shells are a few KB).
+  private assertNotChallenged(body: string, url: string): void {
+    const lowered = body.toLowerCase();
+    const hard = [
+      'cf-mitigated',
+      'enable javascript and cookies',
+      'attention required',
+    ];
+    if (hard.some(m => lowered.includes(m))) {
+      throw new Error(
+        `CLOUDFLARE BLOCK: lnori.com returned a bot-challenge page for ${url}. ` +
+          `Open the novel in the app's webview (or your browser) once to clear it, then retry. ` +
+          `The plugin can't solve Cloudflare's JS challenge.`,
+      );
+    }
+    if (body.length < 20000 && /just a moment/i.test(body)) {
+      throw new Error(
+        `CLOUDFLARE BLOCK: lnori.com is showing "Just a moment" (bot check) for ${url}. ` +
+          `Clear it via webview/browser, then retry.`,
+      );
+    }
+  }
+
   private async fetchPage(url: string): Promise<string> {
-    return fetchText(url, {
+    const body = await fetchText(url, {
       headers: {
         'User-Agent':
           'Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36',
@@ -41,6 +70,8 @@ class LnoriComPlugin implements Plugin.PluginBase {
         Referer: this.site,
       },
     });
+    this.assertNotChallenged(body, url);
+    return body;
   }
 
 
