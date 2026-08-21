@@ -105,6 +105,9 @@ class NovelArchivePlugin implements Plugin.PluginBase {
   version = '1.1.29';
   icon = 'src/en/novelarchive/icon.png';
   site = 'https://novelarchive.cc';
+  // Required by the app's PluginItem: the UPDATE path copies name/site/lang
+  // from this evaluated module back into the stored plugin row.
+  lang = 'English';
   pluginSettings = {
     mergeSeries: {
       label: 'Merge all volumes into one series',

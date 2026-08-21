@@ -10,6 +10,9 @@ class LnoriComPlugin implements Plugin.PluginBase {
   name = 'LNORI.com';
   icon = 'src/en/lnori/icon.png';
   site = 'https://lnori.com/';
+  // Required by the app's PluginItem: the UPDATE path copies name/site/lang
+  // from this evaluated module back into the stored plugin row.
+  lang = 'English';
   version = '1.0.7';
   pluginSettings = {
     mergeCoverTitle: {
