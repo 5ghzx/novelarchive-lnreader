@@ -10,7 +10,7 @@ class LnoriComPlugin implements Plugin.PluginBase {
   name = 'LNORI.com';
   icon = 'src/en/lnori/icon.png';
   site = 'https://lnori.com/';
-  version = '1.0.4';
+  version = '1.0.5';
   pluginSettings = {
     mergeCoverTitle: {
       label: 'Merge cover + title page into one entry',
@@ -291,30 +291,40 @@ class LnoriComPlugin implements Plugin.PluginBase {
       chapters.push(...volChapters);
     }
 
-    // Toggle (default on): fold the "Cover" entry and the following "Title
-    // Page" entry into a single "Cover & Title Page" row. They're just image
-    // pages with no prose, so as separate TOC rows they're pure pollution.
+    // Toggle (default on): fold front/back-matter pages (Cover, Title Page,
+    // Prologue, Colophon, Copyright, etc.) into a single entry. These are image
+    // or stub pages with no prose, so as separate TOC rows they're pure
+    // pollution. They always appear with these words at the END of the chapter
+    // name (e.g. "Book - Cover", "Book - Title Page", "Book - Prologue"), so we
+    // match by suffix and merge any run of consecutive such entries.
     if (storage.get('mergeCoverTitle') ?? true) {
+      const isMatter = (name: string): boolean =>
+        /(cover|title\s*page|prologue|colophon|copyright|front\s*matter|back\s*matter|table of contents)\s*$/i.test(
+          name.trim(),
+        );
       const merged: Plugin.ChapterItem[] = [];
-      for (let i = 0; i < chapters.length; i++) {
+      let i = 0;
+      while (i < chapters.length) {
         const cur = chapters[i];
-        const next = chapters[i + 1];
-        const isCover = /cover/i.test(cur.name);
-        const nextIsTitle = next && /title\s*page/i.test(next.name);
-        if (isCover && nextIsTitle) {
-          // Keep the cover row, append the title-page anchor so parseChapter
-          // renders both images in one entry, then skip the title page.
-          const coverAnchor = cur.path.split('#')[1];
-          const titleAnchor = next.path.split('#')[1];
+        if (isMatter(cur.name)) {
+          // Accumulate this matter entry and any consecutive matter entries.
+          const group = [cur];
+          while (i + 1 < chapters.length && isMatter(chapters[i + 1].name)) {
+            i++;
+            group.push(chapters[i]);
+          }
+          const basePath = cur.path.split('#')[0];
+          const anchors = group.map(c => c.path.split('#')[1]).join(',');
+          const label = group.length === 1 ? cur.name : 'Front/Back Matter';
           merged.push({
             ...cur,
-            name: 'Cover & Title Page',
-            path: `${cur.path.split('#')[0]}#${coverAnchor},${titleAnchor}`,
+            name: label,
+            path: `${basePath}#${anchors}`,
           });
-          i++; // consume the title page
-          continue;
+        } else {
+          merged.push(cur);
         }
-        merged.push(cur);
+        i++;
       }
       chapters = merged;
     }
