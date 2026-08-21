@@ -102,7 +102,7 @@ const CHAPTER_NAME_RE = /^chapter\s*(\d+)/i;
 
 class NovelArchivePlugin implements Plugin.PluginBase {
   id = 'novelarchive';
-  version = '1.1.28';
+  version = '1.1.29';
   icon = 'src/en/novelarchive/icon.png';
   site = 'https://novelarchive.cc';
   pluginSettings = {
@@ -380,24 +380,27 @@ class NovelArchivePlugin implements Plugin.PluginBase {
     novelId: string,
     chapterNumber: number,
   ): Promise<boolean> {
-    const request = (async () => {
-      try {
-        const response = await this.apiGet<ChapterResponse>(
-          `/api/novels/${encodeURIComponent(novelId)}/chapters/${encodeURIComponent(
-            String(chapterNumber),
-          )}`,
-        );
-        return Boolean(response.chapter?.content);
-      } catch {
-        return false;
-      }
-    })();
-    // Bound the probe so a slow/hanging API can't stall the merge. On timeout
-    // we return "keep" (don't drop an unverified chapter).
-    const timeout = new Promise<boolean>(resolve => {
-      setTimeout(() => resolve(true), NovelArchivePlugin.PROBE_TIMEOUT_MS);
-    });
-    return Promise.race([request, timeout]);
+    try {
+      // Use fetchApi directly (not apiGet) so we can inspect the HTTP status.
+      // A confirmed non-OK (e.g. 404) means the chapter is genuinely absent ->
+      // drop it. Any *network* error (timeout, Cloudflare blip, offline) is
+      // UNVERIFIABLE, so we return "keep" — a flaky connection must never wipe
+      // the whole list. (Previously a thrown error returned false, which made
+      // a single bad probe drop the chapter; on a rate-limited/Cloudflare
+      // device enough probes failed that the merged+mega list collapsed to 0.)
+      const resp = await fetchApi(
+        `${this.site}/api/novels/${encodeURIComponent(
+          novelId,
+        )}/chapters/${encodeURIComponent(String(chapterNumber))}`,
+        { headers: { Accept: 'application/json' } },
+      );
+      if (!resp.ok) return false;
+      const data = (await resp.json()) as ChapterResponse;
+      return Boolean(data.chapter?.content);
+    } catch {
+      // Network error / unverifiable -> keep the chapter.
+      return true;
+    }
   }
 
   // Eager mode: probe every chapter in parallel (bounded by
