@@ -10,7 +10,7 @@ class LnoriComPlugin implements Plugin.PluginBase {
   name = 'LNORI.com';
   icon = 'src/en/lnori/icon.png';
   site = 'https://lnori.com/';
-  version = '1.0.5';
+  version = '1.0.6';
   pluginSettings = {
     mergeCoverTitle: {
       label: 'Merge cover + title page into one entry',
@@ -291,36 +291,56 @@ class LnoriComPlugin implements Plugin.PluginBase {
       chapters.push(...volChapters);
     }
 
-    // Toggle (default on): fold front/back-matter pages (Cover, Title Page,
-    // Prologue, Colophon, Copyright, etc.) into a single entry. These are image
-    // or stub pages with no prose, so as separate TOC rows they're pure
-    // pollution. They always appear with these words at the END of the chapter
-    // name (e.g. "Book - Cover", "Book - Title Page", "Book - Prologue"), so we
-    // match by suffix and merge any run of consecutive such entries.
+    // Toggle (default on): fold front/back-matter pages into one entry PER
+    // VOLUME. Real series data (e.g. lnori Konosuba, 17 volumes) shows every
+    // volume carries its own Cover / Insert(s) / Title Page cluster — often
+    // with "Insert" pages BETWEEN Cover and Title Page — so:
+    //   1. match by suffix ("... - Cover", "... - Insert", "... - Title Page"),
+    //   2. group consecutive matter entries that ALSO share the same volume
+    //      path (a group never spans two volumes),
+    //   3. label the merged row from its actual contents with the volume
+    //      prefix kept ("Vol 2 - Cover & Insert & Title Page") so the N groups
+    //      in a multi-volume series stay distinguishable.
     if (storage.get('mergeCoverTitle') ?? true) {
-      const isMatter = (name: string): boolean =>
-        /(cover|title\s*page|prologue|colophon|copyright|front\s*matter|back\s*matter|table of contents)\s*$/i.test(
-          name.trim(),
-        );
+      const MATTER_RE =
+        /(cover|insert|illustration|title\s*page|prologue|colophon|copyright|front\s*matter|back\s*matter|table of contents)\s*$/i;
+      const matterLabel = (name: string): string | null => {
+        const m = name.trim().match(MATTER_RE);
+        if (!m) return null;
+        return m[1].replace(/\s+/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+      };
       const merged: Plugin.ChapterItem[] = [];
       let i = 0;
       while (i < chapters.length) {
         const cur = chapters[i];
-        if (isMatter(cur.name)) {
-          // Accumulate this matter entry and any consecutive matter entries.
+        const curLabel = matterLabel(cur.name);
+        const curBase = cur.path.split('#')[0];
+        if (curLabel) {
           const group = [cur];
-          while (i + 1 < chapters.length && isMatter(chapters[i + 1].name)) {
+          const labels = new Set<string>([curLabel]);
+          let base = curBase;
+          while (
+            i + 1 < chapters.length &&
+            chapters[i + 1].path.split('#')[0] === base &&
+            matterLabel(chapters[i + 1].name)
+          ) {
             i++;
             group.push(chapters[i]);
+            labels.add(matterLabel(chapters[i].name)!);
           }
-          const basePath = cur.path.split('#')[0];
           const anchors = group.map(c => c.path.split('#')[1]).join(',');
-          const label = group.length === 1 ? cur.name : 'Front/Back Matter';
-          merged.push({
-            ...cur,
-            name: label,
-            path: `${basePath}#${anchors}`,
-          });
+          // Volume prefix = everything before the trailing matter suffix of
+          // the first entry ("Konosuba ... Vol 2 - Cover" -> "Konosuba ... Vol 2 - ").
+          const prefix = cur.name.slice(0, cur.name.trim().length - curLabel.length);
+          if (group.length === 1) {
+            merged.push(cur); // lone matter page keeps its own name
+          } else {
+            merged.push({
+              ...cur,
+              name: `${prefix}${Array.from(labels).join(' & ')}`,
+              path: `${base}#${anchors}`,
+            });
+          }
         } else {
           merged.push(cur);
         }
