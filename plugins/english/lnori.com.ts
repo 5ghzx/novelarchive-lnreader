@@ -13,7 +13,7 @@ class LnoriComPlugin implements Plugin.PluginBase {
   // Required by the app's PluginItem: the UPDATE path copies name/site/lang
   // from this evaluated module back into the stored plugin row.
   lang = 'English';
-  version = '1.0.7';
+  version = '1.0.8';
   pluginSettings = {
     mergeCoverTitle: {
       label: 'Merge cover + title page into one entry',

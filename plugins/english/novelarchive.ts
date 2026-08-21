@@ -102,7 +102,7 @@ const CHAPTER_NAME_RE = /^chapter\s*(\d+)/i;
 
 class NovelArchivePlugin implements Plugin.PluginBase {
   id = 'novelarchive';
-  version = '1.1.29';
+  version = '1.1.30';
   icon = 'src/en/novelarchive/icon.png';
   site = 'https://novelarchive.cc';
   // Required by the app's PluginItem: the UPDATE path copies name/site/lang
