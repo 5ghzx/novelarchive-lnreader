@@ -10,7 +10,7 @@ class LnoriComPlugin implements Plugin.PluginBase {
   name = 'LNORI.com';
   icon = 'src/en/lnori/icon.png';
   site = 'https://lnori.com/';
-  version = '1.0.6';
+  version = '1.0.7';
   pluginSettings = {
     mergeCoverTitle: {
       label: 'Merge cover + title page into one entry',
@@ -302,8 +302,9 @@ class LnoriComPlugin implements Plugin.PluginBase {
     //      prefix kept ("Vol 2 - Cover & Insert & Title Page") so the N groups
     //      in a multi-volume series stay distinguishable.
     if (storage.get('mergeCoverTitle') ?? true) {
+      // Plural-tolerant: real TOCs use "Color Illustrations", "Inserts", etc.
       const MATTER_RE =
-        /(cover|insert|illustration|title\s*page|prologue|colophon|copyright|front\s*matter|back\s*matter|table of contents)\s*$/i;
+        /(covers?|inserts?|illustrations?|color\s+illustrations?|title\s*pages?|prologues?|prolog|colophons?|copyrights?|front\s*matters?|back\s*matters?|table\s+of\s+contents?)\s*$/i;
       const matterLabel = (name: string): string | null => {
         const m = name.trim().match(MATTER_RE);
         if (!m) return null;
