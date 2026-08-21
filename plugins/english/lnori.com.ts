@@ -13,7 +13,7 @@ class LnoriComPlugin implements Plugin.PluginBase {
   // Required by the app's PluginItem: the UPDATE path copies name/site/lang
   // from this evaluated module back into the stored plugin row.
   lang = 'English';
-  version = '1.0.8';
+  version = '1.0.9';
   pluginSettings = {
     mergeCoverTitle: {
       label: 'Merge cover + title page into one entry',
@@ -239,6 +239,15 @@ class LnoriComPlugin implements Plugin.PluginBase {
     };
 
     const volumeUrls = Object.keys(volumeMap);
+    // A linkless series page means the fetch got something other than the real
+    // catalog (Cloudflare interstitial, soft-404). Returning [] here used to
+    // surface as a silent "0 chapters"; fail loudly instead.
+    if (volumeUrls.length === 0) {
+      throw new Error(
+        'LNORI.com returned no volumes for this series — the site likely served ' +
+          'a bot-check page. Open it once in webview/browser, then refresh.',
+      );
+    }
     let chapters: Plugin.ChapterItem[] = [];
 
     // Deliberately sequential. The official plugin uses Promise.all here,
