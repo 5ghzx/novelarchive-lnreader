@@ -100,9 +100,18 @@ type DiscoveredVolume = { id: string; title: string };
 // Hoisted so it isn't recompiled for every chapter in every volume.
 const CHAPTER_NAME_RE = /^chapter\s*(\d+)/i;
 
+// Module-level (not instance) caches: LNReader may re-instantiate the plugin
+// object between calls, which silently wipes instance fields. These survive as
+// long as the module itself stays loaded in the app session.
+// searchSeen: dedupe set for search pagination; seriesVolumes: discovered
+// seriesKey -> volume ids (the API has no series endpoint, so discovery is a
+// pair of searches per series — caching skips them on every open/refresh).
+const searchSeen = new Set<string>();
+const seriesVolumes = new Map<string, string[]>();
+
 class NovelArchivePlugin implements Plugin.PluginBase {
   id = 'novelarchive';
-  version = '1.1.30';
+  version = '1.1.31';
   icon = 'src/en/novelarchive/icon.png';
   site = 'https://novelarchive.cc';
   // Required by the app's PluginItem: the UPDATE path copies name/site/lang
@@ -183,11 +192,9 @@ class NovelArchivePlugin implements Plugin.PluginBase {
   // tail, so the app's "stop when empty" rule never trips and it fetches
   // forever, appending duplicate series as empty/ghost rows. We terminate
   // pagination ourselves by returning [] once a page contributes nothing new.
-  private searchSeen = new Set<string>();
   // Cache of seriesKey -> volume ids, discovered during merge. The NovelArchive
   // API has no series endpoint, so we rediscover volumes via search; caching
   // avoids re-hitting the API on every parseNovel (e.g. library refresh).
-  private seriesVolumes = new Map<string, string[]>();
   // Per-volume detail fetch cap (ms) during merge, so a single slow/hanging
   // volume can't stall the whole novel ("loading forever").
   private static readonly VOLUME_TIMEOUT_MS = 8000;
@@ -256,7 +263,7 @@ class NovelArchivePlugin implements Plugin.PluginBase {
     if (storage.get('mergeSeries')) {
       try {
         const key = this.toSeriesKey(source.title);
-        let ids = this.seriesVolumes.get(key);
+        let ids = seriesVolumes.get(key);
         let volCount = 0;
         if (!ids) {
           const fuzzyEnabled = storage.get('fuzzySearch') ?? true;
@@ -297,7 +304,7 @@ class NovelArchivePlugin implements Plugin.PluginBase {
           );
           ids = collected.map(n => n.id).slice(0, 30);
           volCount = ids.length;
-          this.seriesVolumes.set(key, ids);
+          seriesVolumes.set(key, ids);
         } else {
           volCount = ids.length;
         }
@@ -311,10 +318,12 @@ class NovelArchivePlugin implements Plugin.PluginBase {
           if (s.status !== 'fulfilled') continue;
           for (const ch of s.value) {
             seq += 1;
-            merged.push({ ...ch, chapterNumber: seq });
+            // Rename BEFORE spreading: the pushed copy must carry the global
+            // sequence number, not the per-volume one it was fetched with.
             const volMatch = ch.name.match(/Volume\s+(\d+)/i);
             const vol = volMatch ? volMatch[1] : '';
-            if (vol) ch.name = `Volume ${vol} Chapter ${seq}`;
+            const name = vol ? `Volume ${vol} Chapter ${seq}` : ch.name;
+            merged.push({ ...ch, chapterNumber: seq, name });
           }
         }
         if (merged.length) {
@@ -449,18 +458,17 @@ class NovelArchivePlugin implements Plugin.PluginBase {
   ): Promise<Plugin.ChapterItem[]> {
     if (!chapters.length) return chapters;
 
-    // Drop empty (404) chapters FIRST and renumber, so a skipped chapter like
-    // Konosuba's empty Ch.2 never leaves a missing "Chapter 2" heading in the
-    // mega content. The name carries the volume prefix ("Volume N Chapter X")
-    // for merged series; for a single-volume novel the chapters have no prefix
-    // yet, so infer the volume number from the source title below.
-    const cleaned = await this.filterUnavailableChapters(chapters);
+    // Input is ALWAYS already empty-dropped: merge-series filters per-volume
+    // inside fetchVolumeChapters, and the single-volume path filters right
+    // after toChapters. Re-probing all ~320 chapters here doubled the probe
+    // count (+40 s on Konosuba) for zero effect — skipped chapters like
+    // Konosuba's empty Ch.2 are already gone, so headers stay sequential.
 
     // Group by volume number from display name; fall back to the source
     // novel's own volume number when chapters aren't prefixed (single-volume
     // path with merge off).
     const byVolume = new Map<string, Plugin.ChapterItem[]>();
-    for (const ch of cleaned) {
+    for (const ch of chapters) {
       const match = ch.name.match(/Volume\s+(\d+)/i);
       let vol = match ? match[1] : '0';
       if (vol === '0') {
@@ -508,8 +516,10 @@ class NovelArchivePlugin implements Plugin.PluginBase {
     volumeId: string,
     chapters: Plugin.ChapterItem[],
   ): Promise<string> {
-    const htmlParts: string[] = [];
-    for (const ch of chapters) {
+    // Fetch a volume's chapters with bounded parallelism (order preserved via
+    // the indexed results). Sequential fetching made opening a "(Full)" mega
+    // chapter wait on ~19 round-trips; 8-way cuts that to ~3 waves.
+    const tasks = chapters.map(ch => (async (): Promise<string | null> => {
       const [, num] = ch.path.split('/');
       try {
         const resp = await this.apiGet<ChapterResponse>(
@@ -518,15 +528,14 @@ class NovelArchivePlugin implements Plugin.PluginBase {
           )}`,
         );
         const content = resp.chapter?.content;
-        if (content) {
-          htmlParts.push(`<h2>${ch.name}</h2>\n${this.toChapterHtml(content)}`);
-        }
+        if (!content) return null;
+        return `<h2>${ch.name}</h2>\n${this.toChapterHtml(content)}`;
       } catch {
-        // Skip failed chapters silently (already excluded by the eager scan,
-        // but guard against a late 404 here too).
+        return null; // late 404 / blip — already excluded by the eager scan
       }
-    }
-    return htmlParts.join('\n<hr/>\n');
+    })());
+    const parts = await this.runWithConcurrency(tasks, 8);
+    return parts.filter((p): p is string => p !== null).join('\n<hr/>\n');
   }
   // Run async tasks with a bounded concurrency limit, preserving input order.
   private async runWithConcurrency<T>(
@@ -616,7 +625,7 @@ class NovelArchivePlugin implements Plugin.PluginBase {
     // as if they were search hits. Treat a blank normalized query as
     // zero-result so the app shows the standard "no results" state.
     if (!normalized) {
-      if (pageNo <= 1) this.searchSeen.clear();
+      if (pageNo <= 1) searchSeen.clear();
       return [];
     }
 
@@ -633,7 +642,7 @@ class NovelArchivePlugin implements Plugin.PluginBase {
 
     // A fresh search starts with a clean seen-set so prior searches don't
     // suppress this one's results.
-    if (pageNo <= 1) this.searchSeen.clear();
+    if (pageNo <= 1) searchSeen.clear();
 
     const items = this.toNovelItems(response.novels, true);
 
@@ -645,8 +654,8 @@ class NovelArchivePlugin implements Plugin.PluginBase {
     const mergeOn = Boolean(storage.get('mergeSeries'));
     const fresh = items.filter(item => {
       const key = mergeOn ? this.toSeriesKey(item.name || '') : item.path;
-      if (!key || this.searchSeen.has(key)) return false;
-      this.searchSeen.add(key);
+      if (!key || searchSeen.has(key)) return false;
+      searchSeen.add(key);
       return true;
     });
 

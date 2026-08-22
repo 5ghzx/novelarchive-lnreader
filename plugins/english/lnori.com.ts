@@ -2,8 +2,17 @@ import { fetchText } from '@libs/fetch';
 import { storage } from '@libs/storage';
 import { Plugin } from '@/types/plugin';
 import { Filters, FilterTypes } from '@libs/filterInputs';
-import { load as parseHTML } from 'cheerio';
+import { load as parseHTML, type CheerioAPI } from 'cheerio';
 import { defaultCover } from '@libs/defaultCover';
+
+// Module-level (not instance) cache: LNReader may re-instantiate the plugin
+// object between calls, wiping instance fields — that re-downloaded the whole
+// ~1.8 MB / 884-card library page on every Browse page. Survives as long as
+// the module stays loaded in the app session.
+let libraryCache: {
+  items: { novel: Plugin.NovelItem; author: string; tags: string[] }[];
+  at: number;
+} | null = null;
 
 class LnoriComPlugin implements Plugin.PluginBase {
   id = 'lnori-com';
@@ -13,7 +22,7 @@ class LnoriComPlugin implements Plugin.PluginBase {
   // Required by the app's PluginItem: the UPDATE path copies name/site/lang
   // from this evaluated module back into the stored plugin row.
   lang = 'English';
-  version = '1.0.9';
+  version = '1.0.10';
   pluginSettings = {
     mergeCoverTitle: {
       label: 'Merge cover + title page into one entry',
@@ -84,9 +93,6 @@ class LnoriComPlugin implements Plugin.PluginBase {
   // the main page hang / load "infinitely"). Fetched once, then paginated from
   // memory. The cache is cleared on app restart; a manual pull-to-refresh is
   // unnecessary because the library list itself isn't user-specific.
-  private libraryCache:
-    | { items: { novel: Plugin.NovelItem; author: string; tags: string[] }[]; at: number }
-    | null = null;
 
   private async getLibraryNovels(): Promise<
     {
@@ -95,7 +101,7 @@ class LnoriComPlugin implements Plugin.PluginBase {
       tags: string[];
     }[]
   > {
-    if (this.libraryCache) return this.libraryCache.items;
+    if (libraryCache) return libraryCache.items;
     const url = this.site + 'library';
     const body = await this.fetchPage(url);
     const $ = parseHTML(body);
@@ -133,7 +139,7 @@ class LnoriComPlugin implements Plugin.PluginBase {
       }
     });
 
-    this.libraryCache = { items: parsedList, at: Date.now() };
+    libraryCache = { items: parsedList, at: Date.now() };
     return parsedList;
   }
 
@@ -248,21 +254,10 @@ class LnoriComPlugin implements Plugin.PluginBase {
           'a bot-check page. Open it once in webview/browser, then refresh.',
       );
     }
-    let chapters: Plugin.ChapterItem[] = [];
-
-    // Deliberately sequential. The official plugin uses Promise.all here,
-    // causing every volume page to be fetched and parsed concurrently.
-    // Keeping exactly one volume in flight at a time reduces CPU/RAM pressure
-    // on low-power/e-ink Android devices.
-    for (const volUrl of volumeUrls) {
-      const fullVolUrl = this.site.replace(/\/$/, '') + volUrl;
-      const volHtml = await this.fetchPage(fullVolUrl);
-      const $vol = parseHTML(volHtml);
+    // Per-volume page -> chapter list (pure parse, no I/O).
+    const parseVolume = ($vol: CheerioAPI, volUrl: string): Plugin.ChapterItem[] => {
       const volChapters: Plugin.ChapterItem[] = [];
-
-      const tocLinks = $vol(
-        'nav.toc-view a[href^="#"], nav#toc-list a[href^="#"]',
-      );
+      const tocLinks = $vol('nav.toc-view a[href^="#"], nav#toc-list a[href^="#"]');
 
       if (tocLinks.length > 0) {
         tocLinks.each((i, el) => {
@@ -271,13 +266,8 @@ class LnoriComPlugin implements Plugin.PluginBase {
           const id = href.substring(1);
           const tocTitle = $vol(el).text().trim().replace(/\s+/g, ' ');
           const section = $vol(`section#${id}`);
-          const h2Title = section
-            .find('h2.chapter-title, h2, h3')
-            .first()
-            .text()
-            .trim();
-          const chapterName =
-            tocTitle || h2Title || `Page ${id.replace(/\D/g, '')}`;
+          const h2Title = section.find('h2.chapter-title, h2, h3').first().text().trim();
+          const chapterName = tocTitle || h2Title || `Page ${id.replace(/\D/g, '')}`;
           const volTitle = getVolumeName(volUrl, volumeMap[volUrl]);
           let path = volUrl;
           if (path.startsWith('/')) path = path.substring(1);
@@ -287,11 +277,7 @@ class LnoriComPlugin implements Plugin.PluginBase {
         $vol('section.chapter').each((i, el) => {
           const id = $vol(el).attr('id');
           if (!id) return;
-          const h2Title = $vol(el)
-            .find('h2.chapter-title, h2, h3')
-            .first()
-            .text()
-            .trim();
+          const h2Title = $vol(el).find('h2.chapter-title, h2, h3').first().text().trim();
           if (!h2Title) return;
           const volTitle = getVolumeName(volUrl, volumeMap[volUrl]);
           let path = volUrl;
@@ -299,9 +285,29 @@ class LnoriComPlugin implements Plugin.PluginBase {
           volChapters.push({ name: `${volTitle} - ${h2Title}`, path: path + '#' + id });
         });
       }
+      return volChapters;
+    };
 
-      chapters.push(...volChapters);
-    }
+    // Fetch volume pages with a small bounded pool (order preserved via
+    // indexed results). Purely-sequential fetching made a 17-volume series
+    // wait on 17 serialized ~350 KB pages; 4-way keeps RAM pressure low for
+    // e-ink devices while cutting wall time to roughly a quarter.
+    const results: Plugin.ChapterItem[][] = new Array(volumeUrls.length);
+    let cursor = 0;
+    const workers = Array.from(
+      { length: Math.min(4, volumeUrls.length) },
+      async () => {
+        while (cursor < volumeUrls.length) {
+          const idx = cursor++;
+          const volUrl = volumeUrls[idx];
+          const fullVolUrl = this.site.replace(/\/$/, '') + volUrl;
+          const $vol = parseHTML(await this.fetchPage(fullVolUrl));
+          results[idx] = parseVolume($vol, volUrl);
+        }
+      },
+    );
+    await Promise.all(workers);
+    let chapters: Plugin.ChapterItem[] = results.flat();
 
     // Toggle (default on): fold front/back-matter pages into one entry PER
     // VOLUME. Real series data (e.g. lnori Konosuba, 17 volumes) shows every
