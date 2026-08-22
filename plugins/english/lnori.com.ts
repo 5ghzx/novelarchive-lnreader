@@ -22,7 +22,7 @@ class LnoriComPlugin implements Plugin.PluginBase {
   // Required by the app's PluginItem: the UPDATE path copies name/site/lang
   // from this evaluated module back into the stored plugin row.
   lang = 'English';
-  version = '1.0.10';
+  version = '1.0.11';
   pluginSettings = {
     mergeCoverTitle: {
       label: 'Merge cover + title page into one entry',
@@ -391,11 +391,20 @@ class LnoriComPlugin implements Plugin.PluginBase {
       if (href) tocAnchors.push(href.substring(1));
     });
 
-    // Multi-anchor (merged cover+title): concatenate each section's content.
-    if (anchors.length > 1) {
-      const parts = anchors.map(a => {
-        const sel = a ? `section#${a}` : 'section.chapter';
-        const sec = $(sel);
+    // Render one TOC anchor: the section itself PLUS every following
+    // sibling <section class="chapter"> up to (not including) the next
+    // TOC-listed anchor. Chapters span MULTIPLE unnamed page-sections
+    // (Konosuba Vol 1 Prologue = page10+page11+page12) — rendering only the
+    // named section silently truncated the tail of every chapter.
+    const renderAnchorRange = (anchor: string): string => {
+      const currentIndex = tocAnchors.indexOf(anchor);
+      const nextAnchor =
+        currentIndex !== -1 && currentIndex + 1 < tocAnchors.length
+          ? tocAnchors[currentIndex + 1]
+          : null;
+      if (tocAnchors.length === 0 || currentIndex === -1) {
+        // Anchor not in TOC (or no TOC): fall back to just that section.
+        const sec = anchor ? $(`section#${anchor}`) : $('section.chapter').first();
         if (!sec.length) return '';
         const mc = sec.find('.main').length ? sec.find('.main').clone() : sec.clone();
         mc.find('h2, h3, .chapter-title').remove();
@@ -408,44 +417,23 @@ class LnoriComPlugin implements Plugin.PluginBase {
           if (srcset && srcset.startsWith('/')) $(el).attr('srcset', this.site.replace(/\/$/, '') + srcset);
         });
         return mc.html() || '';
-      });
-      return parts.filter(Boolean).join('\n');
-    }
-
-    const anchor = anchors[0] || '';
-    const chapterSelector = anchor ? `section#${anchor}` : 'section.chapter';
-    const section = $(chapterSelector);
-    if (!section.length) {
-      throw new Error(`Chapter section not found: ${chapterPath}`);
-    }
-
-    if (tocAnchors.length > 0 && anchor) {
-      const currentIndex = tocAnchors.indexOf(anchor);
-      const nextAnchor =
-        currentIndex !== -1 && currentIndex + 1 < tocAnchors.length
-          ? tocAnchors[currentIndex + 1]
-          : null;
+      }
       const pagesContent: string[] = [];
-      let stepSection = section;
-
+      let stepSection = $(`section#${anchor}`);
       while (stepSection.length) {
-        const mainContent = stepSection.find('.main').length
+        const mc = stepSection.find('.main').length
           ? stepSection.find('.main').clone()
           : stepSection.clone();
-        mainContent.find('h2, h3, .chapter-title').remove();
-        mainContent.find('img').each((i, el) => {
+        mc.find('h2, h3, .chapter-title').remove();
+        mc.find('img').each((i, el) => {
           const src = $(el).attr('src');
-          if (src && src.startsWith('/')) {
-            $(el).attr('src', this.site.replace(/\/$/, '') + src);
-          }
+          if (src && src.startsWith('/')) $(el).attr('src', this.site.replace(/\/$/, '') + src);
         });
-        mainContent.find('source').each((i, el) => {
+        mc.find('source').each((i, el) => {
           const srcset = $(el).attr('srcset');
-          if (srcset && srcset.startsWith('/')) {
-            $(el).attr('srcset', this.site.replace(/\/$/, '') + srcset);
-          }
+          if (srcset && srcset.startsWith('/')) $(el).attr('srcset', this.site.replace(/\/$/, '') + srcset);
         });
-        const html = mainContent.html();
+        const html = mc.html();
         if (html) pagesContent.push(html);
 
         let nextSibling = stepSection.next();
@@ -456,6 +444,22 @@ class LnoriComPlugin implements Plugin.PluginBase {
         if (nextAnchor && stepSection.attr('id') === nextAnchor) break;
       }
       return pagesContent.join('\n');
+    };
+
+    // Multi-anchor (merged matter rows): render each anchor's full range.
+    if (anchors.length > 1) {
+      return anchors.map(a => renderAnchorRange(a)).filter(Boolean).join('\n');
+    }
+
+    const anchor = anchors[0] || '';
+    const chapterSelector = anchor ? `section#${anchor}` : 'section.chapter';
+    const section = $(chapterSelector);
+    if (!section.length) {
+      throw new Error(`Chapter section not found: ${chapterPath}`);
+    }
+
+    if (anchor || tocAnchors.length > 0) {
+      return renderAnchorRange(anchor);
     }
 
     const mainContent = section.find('.main').length
