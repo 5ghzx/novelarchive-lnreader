@@ -22,7 +22,7 @@ class LnoriComPlugin implements Plugin.PluginBase {
   // Required by the app's PluginItem: the UPDATE path copies name/site/lang
   // from this evaluated module back into the stored plugin row.
   lang = 'English';
-  version = '1.0.14';
+  version = '1.0.15';
   pluginSettings = {
     mergeCoverTitle: {
       label: 'Merge cover + title page into one entry',
@@ -79,12 +79,12 @@ class LnoriComPlugin implements Plugin.PluginBase {
 
   // Hard timeout so a held-open socket (Cloudflare tarpit, dead wifi) can
   // never spin the UI forever — the app's fetch has NO timeout of its own.
-  private static readonly FETCH_TIMEOUT_MS = 20000;
+  private static readonly FETCH_TIMEOUT_MS = 60000;
 
   private async fetchPage(url: string): Promise<string> {
     const body = await new Promise<string>((resolve, reject) => {
       const timer = setTimeout(
-        () => reject(new Error(`LNORI.com timed out after 20s: ${url}`)),
+        () => reject(new Error(`LNORI.com timed out after 60s: ${url}`)),
         LnoriComPlugin.FETCH_TIMEOUT_MS,
       );
       fetchText(url, {
