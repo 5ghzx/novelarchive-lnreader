@@ -22,7 +22,7 @@ class LnoriComPlugin implements Plugin.PluginBase {
   // Required by the app's PluginItem: the UPDATE path copies name/site/lang
   // from this evaluated module back into the stored plugin row.
   lang = 'English';
-  version = '1.0.13';
+  version = '1.0.14';
   pluginSettings = {
     mergeCoverTitle: {
       label: 'Merge cover + title page into one entry',
@@ -58,7 +58,7 @@ class LnoriComPlugin implements Plugin.PluginBase {
       /just a moment|attention required|please wait|checking your browser/i.test(title);
     if (
       isSmall &&
-      (/cf-mitigated|challenge-platform|cf_chl_opt|cdn-cgi\/challenge/.test(body) ||
+      (/cf-mitigated|cf_chl_opt|cdn-cgi\/challenge\/(?!scripts\/jsd)/.test(body) ||
         hasChallengeTitle)
     ) {
       throw new Error(
