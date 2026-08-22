@@ -116,7 +116,7 @@ class NovelArchivePlugin implements Plugin.PluginBase {
   // nameless source rows (localeCompare crash) were born. Keep in lockstep
   // with the manifest entry build-dist.mjs generates.
   name = 'Novel Archive';
-  version = '1.1.33';
+  version = '1.1.34';
   icon = 'src/en/novelarchive/icon.png';
   site = 'https://novelarchive.cc';
   lang = 'English';
@@ -124,7 +124,7 @@ class NovelArchivePlugin implements Plugin.PluginBase {
     mergeSeries: {
       label: 'Merge all volumes into one series',
       type: 'Switch',
-      value: false,
+      value: true,
     },
     skipUnavailable: {
       label: 'Skip empty chapters (drop & renumber)',
@@ -134,7 +134,7 @@ class NovelArchivePlugin implements Plugin.PluginBase {
     mergeVolumesToMega: {
       label: 'Merge chapters into volume mega-chapters',
       type: 'Switch',
-      value: false,
+      value: true,
     },
     fuzzySearch: {
       label: 'Fuzzy search',
