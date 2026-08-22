@@ -22,7 +22,7 @@ class LnoriComPlugin implements Plugin.PluginBase {
   // Required by the app's PluginItem: the UPDATE path copies name/site/lang
   // from this evaluated module back into the stored plugin row.
   lang = 'English';
-  version = '1.0.12';
+  version = '1.0.13';
   pluginSettings = {
     mergeCoverTitle: {
       label: 'Merge cover + title page into one entry',
@@ -47,23 +47,32 @@ class LnoriComPlugin implements Plugin.PluginBase {
   // it as a challenge when the page is tiny (real lnori pages are MB-scale,
   // challenge shells are a few KB).
   private assertNotChallenged(body: string, url: string): void {
-    const lowered = body.toLowerCase();
-    const hard = [
-      'cf-mitigated',
-      'enable javascript and cookies',
-      'attention required',
-    ];
-    if (hard.some(m => lowered.includes(m))) {
+    // Structural detection only. Textual markers like "attention required"
+    // FALSE-POSITIVE on novel prose (Re:Zero Vol 14 literally contains
+    // "Special attention required." in a 577 KB chapter page) and made the
+    // whole series return 0 chapters. A real challenge shell is tiny and
+    // carries CF's chrome — match that shape, never bare phrases.
+    const isSmall = body.length < 30000;
+    const title = (body.match(/<title[^>]*>([\s\S]{0,120}?)<\/title>/i)?.[1] ?? '');
+    const hasChallengeTitle =
+      /just a moment|attention required|please wait|checking your browser/i.test(title);
+    if (
+      isSmall &&
+      (/cf-mitigated|challenge-platform|cf_chl_opt|cdn-cgi\/challenge/.test(body) ||
+        hasChallengeTitle)
+    ) {
       throw new Error(
         `CLOUDFLARE BLOCK: lnori.com returned a bot-challenge page for ${url}. ` +
           `Open the novel in the app's webview (or your browser) once to clear it, then retry. ` +
           `The plugin can't solve Cloudflare's JS challenge.`,
       );
     }
-    if (body.length < 20000 && /just a moment/i.test(body)) {
+    // Real lnori pages are hundreds of KB; a tiny non-challenge page is a
+    // soft error worth surfacing rather than parsing into "0 chapters".
+    if (isSmall && !/<section class="chapter"|article\.card/.test(body)) {
       throw new Error(
-        `CLOUDFLARE BLOCK: lnori.com is showing "Just a moment" (bot check) for ${url}. ` +
-          `Clear it via webview/browser, then retry.`,
+        `LNORI.com returned a ${body.length}-byte page with no content for ${url} — ` +
+          `likely rate-limited. Retry shortly or via webview.`,
       );
     }
   }
@@ -341,7 +350,7 @@ class LnoriComPlugin implements Plugin.PluginBase {
     if (storage.get('mergeCoverTitle') ?? true) {
       // Plural-tolerant: real TOCs use "Color Illustrations", "Inserts", etc.
       const MATTER_RE =
-        /(covers?|inserts?|illustrations?|color\s+illustrations?|title\s*pages?|prologues?|prolog|colophons?|copyrights?|front\s*matters?|back\s*matters?|table\s+of\s+contents?)\s*$/i;
+        /(character\s+galleries?|covers?|inserts?|illustrations?|color\s+illustrations?|title\s*pages?|prologues?|prolog|colophons?|copyrights?|front\s*matters?|back\s*matters?|table\s+of\s+contents?)\s*$/i;
       const matterLabel = (name: string): string | null => {
         const m = name.trim().match(MATTER_RE);
         if (!m) return null;
