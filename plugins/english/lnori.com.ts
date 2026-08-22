@@ -22,7 +22,7 @@ class LnoriComPlugin implements Plugin.PluginBase {
   // Required by the app's PluginItem: the UPDATE path copies name/site/lang
   // from this evaluated module back into the stored plugin row.
   lang = 'English';
-  version = '1.0.11';
+  version = '1.0.12';
   pluginSettings = {
     mergeCoverTitle: {
       label: 'Merge cover + title page into one entry',
@@ -68,19 +68,38 @@ class LnoriComPlugin implements Plugin.PluginBase {
     }
   }
 
+  // Hard timeout so a held-open socket (Cloudflare tarpit, dead wifi) can
+  // never spin the UI forever — the app's fetch has NO timeout of its own.
+  private static readonly FETCH_TIMEOUT_MS = 20000;
+
   private async fetchPage(url: string): Promise<string> {
-    const body = await fetchText(url, {
-      headers: {
-        'User-Agent':
-          'Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36',
-        Accept:
-          'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Sec-Fetch-Mode': 'navigate',
-        'Sec-Fetch-Dest': 'document',
-        'Sec-Fetch-Site': 'same-origin',
-        Referer: this.site,
-      },
+    const body = await new Promise<string>((resolve, reject) => {
+      const timer = setTimeout(
+        () => reject(new Error(`LNORI.com timed out after 20s: ${url}`)),
+        LnoriComPlugin.FETCH_TIMEOUT_MS,
+      );
+      fetchText(url, {
+        headers: {
+          'User-Agent':
+            'Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36',
+          Accept:
+            'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+          'Accept-Language': 'en-US,en;q=0.9',
+          'Sec-Fetch-Mode': 'navigate',
+          'Sec-Fetch-Dest': 'document',
+          'Sec-Fetch-Site': 'same-origin',
+          Referer: this.site,
+        },
+      }).then(
+        b => {
+          clearTimeout(timer);
+          resolve(b);
+        },
+        e => {
+          clearTimeout(timer);
+          reject(e instanceof Error ? e : new Error(String(e)));
+        },
+      );
     });
     this.assertNotChallenged(body, url);
     return body;

@@ -111,7 +111,7 @@ const seriesVolumes = new Map<string, string[]>();
 
 class NovelArchivePlugin implements Plugin.PluginBase {
   id = 'novelarchive';
-  version = '1.1.31';
+  version = '1.1.32';
   icon = 'src/en/novelarchive/icon.png';
   site = 'https://novelarchive.cc';
   // Required by the app's PluginItem: the UPDATE path copies name/site/lang
@@ -312,6 +312,10 @@ class NovelArchivePlugin implements Plugin.PluginBase {
         const settled = await Promise.allSettled(
           ids.map(vid => this.fetchVolumeChapters(vid)),
         );
+        // A volume that failed (timeout/5xx) contributes ZERO chapters, which
+        // used to silently produce a truncated series (user-visible as "only
+        // Volume 1 exists"). Surface failures instead of swallowing them.
+        const failed = settled.filter(s => s.status === 'rejected').length;
         const merged: Plugin.ChapterItem[] = [];
         let seq = 0;
         for (const s of settled) {
@@ -328,16 +332,22 @@ class NovelArchivePlugin implements Plugin.PluginBase {
         }
         if (merged.length) {
           novel.chapters = merged;
-          // The merged list is already empty-dropped: each volume was filtered
-          // inside fetchVolumeChapters. Re-scanning all ~318 chapters here was
-          // the cause of the "Merge volumes spins forever" regression.
-          const banner = `[${volCount} volumes merged — ${merged.length} chapters total]\n`;
-          novel.summary = novel.summary ? banner + novel.summary : banner;
+          let banner = `[${volCount} volumes merged — ${merged.length} chapters total]`;
+          if (failed > 0) {
+            banner += ` — WARNING: ${failed} volume(s) failed to load; refresh to retry`;
+          }
+          novel.summary = `${banner}\n` + (novel.summary ?? '');
+        } else if (failed > 0) {
+          // Every volume failed — do NOT leave a stale/partial list behind.
+          throw new Error(
+            `All ${volCount} volumes failed to load — check connection, then refresh the novel.`,
+          );
         }
       } catch {
-        // Fall back to the single-volume (already filtered) chapters.
+        // Discovery/fetch blew up — fall back to the single-volume list
+        // (already filtered) rather than leaving a broken state.
       }
-    }
+     }
 
     // STEP 3: Merge each volume's chapters into one mega-chapter (if enabled).
     if (storage.get('mergeVolumesToMega')) {
