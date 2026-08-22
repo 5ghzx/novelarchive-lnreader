@@ -111,11 +111,14 @@ const seriesVolumes = new Map<string, string[]>();
 
 class NovelArchivePlugin implements Plugin.PluginBase {
   id = 'novelarchive';
-  version = '1.1.32';
+  // REQUIRED by the app's update path: it overwrites the stored row's
+  // name/site/lang from THIS evaluated module. A missing field here is how
+  // nameless source rows (localeCompare crash) were born. Keep in lockstep
+  // with the manifest entry build-dist.mjs generates.
+  name = 'Novel Archive';
+  version = '1.1.33';
   icon = 'src/en/novelarchive/icon.png';
   site = 'https://novelarchive.cc';
-  // Required by the app's PluginItem: the UPDATE path copies name/site/lang
-  // from this evaluated module back into the stored plugin row.
   lang = 'English';
   pluginSettings = {
     mergeSeries: {
