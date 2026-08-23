@@ -22,7 +22,7 @@ class LnoriComPlugin implements Plugin.PluginBase {
   // Required by the app's PluginItem: the UPDATE path copies name/site/lang
   // from this evaluated module back into the stored plugin row.
   lang = 'English';
-  version = '1.0.15';
+  version = '1.0.16';
   pluginSettings = {
     mergeCoverTitle: {
       label: 'Merge cover + title page into one entry',
@@ -350,7 +350,7 @@ class LnoriComPlugin implements Plugin.PluginBase {
     if (storage.get('mergeCoverTitle') ?? true) {
       // Plural-tolerant: real TOCs use "Color Illustrations", "Inserts", etc.
       const MATTER_RE =
-        /(character\s+galleries?|covers?|inserts?|illustrations?|color\s+illustrations?|title\s*pages?|prologues?|prolog|colophons?|copyrights?|front\s*matters?|back\s*matters?|table\s+of\s+contents?)\s*$/i;
+        /(character\s+galler(?:y|ies)|covers?|inserts?|illustrations?|color\s+illustrations?|title\s*pages?|prolog(?:ue|s)?|prolog|colophons?|copyrights?|front\s*matters?|back\s*matters?|table\s+of\s+contents?)\s*$/i;
       const matterLabel = (name: string): string | null => {
         const m = name.trim().match(MATTER_RE);
         if (!m) return null;
