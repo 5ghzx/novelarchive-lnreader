@@ -22,7 +22,7 @@ class LnoriComPlugin implements Plugin.PluginBase {
   // Required by the app's PluginItem: the UPDATE path copies name/site/lang
   // from this evaluated module back into the stored plugin row.
   lang = 'English';
-  version = '1.0.17';
+  version = '1.0.18';
   pluginSettings = {
     mergeCoverTitle: {
       label: 'Merge cover + title page into one entry',
@@ -64,7 +64,8 @@ class LnoriComPlugin implements Plugin.PluginBase {
 
   // Hard timeout so a held-open socket (Cloudflare tarpit, dead wifi) can
   // never spin the UI forever — the app's fetch has NO timeout of its own.
-  private static readonly FETCH_TIMEOUT_MS = 60000;
+  // 20s is generous for a first byte; 3 attempts cap the worst case ~65s.
+  private static readonly FETCH_TIMEOUT_MS = 20000;
 
   // The site intermittently serves HTTP 200 with an empty/truncated body or
   // drops a socket (observed on a busy session). Quick bounded retries clear
@@ -79,24 +80,22 @@ class LnoriComPlugin implements Plugin.PluginBase {
       try {
         body = await new Promise<string>((resolve, reject) => {
           const timer = setTimeout(
-            () => reject(new Error(`LNORI.com timed out after 60s: ${url}`)),
+            () =>
+              reject(
+                new Error(
+                  `LNORI.com timed out after ${LnoriComPlugin.FETCH_TIMEOUT_MS / 1000}s: ${url}`,
+                ),
+              ),
             LnoriComPlugin.FETCH_TIMEOUT_MS,
           );
           fetchText(url, {
-            // Browser-like header set so Cloudflare treats these requests like
-            // the webview, which already passes on the same device/network
-            // (the app's default fingerprint gets challenged fresh).
-            headers: {
-              'User-Agent':
-                'Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36',
-              Accept:
-                'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-              'Accept-Language': 'en-US,en;q=0.9',
-              'Sec-Fetch-Mode': 'navigate',
-              'Sec-Fetch-Dest': 'document',
-              'Sec-Fetch-Site': 'same-origin',
-              Referer: this.site,
-            },
+            // Deliberately NO custom headers. Claiming to be Chrome (mobile UA
+            // + Sec-Fetch-* headers) while presenting the app's native TLS
+            // fingerprint trips Cloudflare's bot rules on some networks: the
+            // handshake completes, the request is read, and the response is
+            // then silently withheld (observed on-device byte-for-byte via a
+            // CONNECT tunnel; desktop Java/curl with the same headers pass).
+            // The app's plain, honest fingerprint passes without challenge.
           }).then(
             b => {
               clearTimeout(timer);
