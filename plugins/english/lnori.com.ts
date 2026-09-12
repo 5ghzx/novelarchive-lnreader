@@ -22,7 +22,7 @@ class LnoriComPlugin implements Plugin.PluginBase {
   // Required by the app's PluginItem: the UPDATE path copies name/site/lang
   // from this evaluated module back into the stored plugin row.
   lang = 'English';
-  version = '1.0.18';
+  version = '1.0.19';
   pluginSettings = {
     mergeCoverTitle: {
       label: 'Merge cover + title page into one entry',
@@ -89,13 +89,19 @@ class LnoriComPlugin implements Plugin.PluginBase {
             LnoriComPlugin.FETCH_TIMEOUT_MS,
           );
           fetchText(url, {
-            // Deliberately NO custom headers. Claiming to be Chrome (mobile UA
-            // + Sec-Fetch-* headers) while presenting the app's native TLS
-            // fingerprint trips Cloudflare's bot rules on some networks: the
-            // handshake completes, the request is read, and the response is
-            // then silently withheld (observed on-device byte-for-byte via a
-            // CONNECT tunnel; desktop Java/curl with the same headers pass).
-            // The app's plain, honest fingerprint passes without challenge.
+            // Suppress the app's default Chrome UA (documented app hook:
+            // 'User-Agent': undefined removes the header entirely).
+            //
+            // Why: lnori.com's Cloudflare zone silently tarpits requests that
+            // CLAIM to be Chrome while presenting a non-Chrome TLS fingerprint
+            // (the app's stack) — handshake completes, request is read, then
+            // no response ever arrives (verified byte-level on-device via a
+            // CONNECT tunnel; the site has no API to fall back to). Every
+            // HONEST client observed passes: curl (curl UA), Java (Java UA),
+            // and the raw app fetch on other sources. A request with no UA is
+            // coherent — "I am not a browser" — and matches the passing
+            // pattern instead of the tarpitted one.
+            headers: { 'User-Agent': undefined },
           }).then(
             b => {
               clearTimeout(timer);
