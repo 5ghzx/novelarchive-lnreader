@@ -22,7 +22,7 @@ class LnoriComPlugin implements Plugin.PluginBase {
   // Required by the app's PluginItem: the UPDATE path copies name/site/lang
   // from this evaluated module back into the stored plugin row.
   lang = 'English';
-  version = '1.0.19';
+  version = '1.0.20';
   pluginSettings = {
     mergeCoverTitle: {
       label: 'Merge cover + title page into one entry',
@@ -30,114 +30,34 @@ class LnoriComPlugin implements Plugin.PluginBase {
       value: true,
     },
   };
-  // Classify a fetched page so we can surface a clear error instead of
-  // silently parsing a challenge shell as "0 chapters". Structural detection
-  // only: textual markers like "attention required" FALSE-POSITIVE on novel
-  // prose (Re:Zero Vol 14 literally contains "Special attention required."
-  // in a 577 KB chapter page). A real challenge shell is tiny and carries
-  // CF's chrome — match that shape, never bare phrases.
-  // Page-type-aware soft-failure check: series pages legitimately lack
-  // section.chapter/article.card, so those markers alone must not condemn a
-  // small page; every real lnori page carries at least one of the markers below.
-  private classifyResponse(body: string): 'ok' | 'challenge' | 'soft' {
-    const isSmall = body.length < 30000;
-    if (!isSmall) return 'ok';
-    const title = (body.match(/<title[^>]*>([\s\S]{0,120}?)<\/title>/i)?.[1] ?? '');
-    const hasChallengeTitle =
-      /just a moment|attention required|please wait|checking your browser/i.test(title);
+  // IMPORTANT: the network layer here deliberately mirrors the official
+  // LNReader lnori plugin (LNReader/lnreader-plugins, master,
+  // plugins/english/lnori.ts) — one bare fetchText() per page, no custom
+  // headers, NO timeout wrapper, NO retries, NO multi-request bursts. An
+  // earlier version of this plugin added 60s hard timeouts with 3-attempt
+  // retry storms; that request pattern is what kept Cloudflare tarpitting
+  // the app on-device (the official plugin's single, patient request passes
+  // on the same phone and network). The app's fetchText also swallows all
+  // errors and returns '' on failure, so an outage shows up as a small or
+  // empty page rather than a thrown network error.
+  private async fetchPage(url: string): Promise<string> {
+    const body = await fetchText(url);
     if (
-      /cf-mitigated|cf_chl_opt|cdn-cgi\/challenge\/(?!scripts\/jsd)/.test(body) ||
-      hasChallengeTitle
-    ) {
-      return 'challenge';
-    }
-    if (
-      !/<section class="chapter"|article\.card|class="s-title"|class="hero-card"|class="toc-view"/.test(
+      body.length < 3000 &&
+      !/class="s-title"|class="hero-card"|article\.card|toc-view|section class="chapter"/.test(
         body,
       )
     ) {
-      // Observed in the wild: HTTP 200 with a 0-byte body under load.
-      return 'soft';
-    }
-    return 'ok';
-  }
-
-  // Hard timeout so a held-open socket (Cloudflare tarpit, dead wifi) can
-  // never spin the UI forever — the app's fetch has NO timeout of its own.
-  // 20s is generous for a first byte; 3 attempts cap the worst case ~65s.
-  private static readonly FETCH_TIMEOUT_MS = 20000;
-
-  // The site intermittently serves HTTP 200 with an empty/truncated body or
-  // drops a socket (observed on a busy session). Quick bounded retries clear
-  // those transients without user-visible errors. Cloudflare challenges are
-  // NOT retried — they never clear by re-requesting.
-  private static readonly FETCH_ATTEMPTS = 3;
-
-  private async fetchPage(url: string): Promise<string> {
-    let lastError = new Error('LNORI.com: fetch did not run');
-    for (let attempt = 1; attempt <= LnoriComPlugin.FETCH_ATTEMPTS; attempt++) {
-      let body: string;
-      try {
-        body = await new Promise<string>((resolve, reject) => {
-          const timer = setTimeout(
-            () =>
-              reject(
-                new Error(
-                  `LNORI.com timed out after ${LnoriComPlugin.FETCH_TIMEOUT_MS / 1000}s: ${url}`,
-                ),
-              ),
-            LnoriComPlugin.FETCH_TIMEOUT_MS,
-          );
-          fetchText(url, {
-            // Suppress the app's default Chrome UA (documented app hook:
-            // 'User-Agent': undefined removes the header entirely).
-            //
-            // Why: lnori.com's Cloudflare zone silently tarpits requests that
-            // CLAIM to be Chrome while presenting a non-Chrome TLS fingerprint
-            // (the app's stack) — handshake completes, request is read, then
-            // no response ever arrives (verified byte-level on-device via a
-            // CONNECT tunnel; the site has no API to fall back to). Every
-            // HONEST client observed passes: curl (curl UA), Java (Java UA),
-            // and the raw app fetch on other sources. A request with no UA is
-            // coherent — "I am not a browser" — and matches the passing
-            // pattern instead of the tarpitted one.
-            headers: { 'User-Agent': undefined },
-          }).then(
-            b => {
-              clearTimeout(timer);
-              resolve(b);
-            },
-            e => {
-              clearTimeout(timer);
-              reject(e instanceof Error ? e : new Error(String(e)));
-            },
-          );
-        });
-      } catch (e) {
-        lastError = e instanceof Error ? e : new Error(String(e));
-        if (attempt < LnoriComPlugin.FETCH_ATTEMPTS) {
-          await new Promise(r => setTimeout(r, 700 * attempt));
-          continue;
-        }
-        throw lastError;
-      }
-      const verdict = this.classifyResponse(body);
-      if (verdict === 'ok') return body;
-      lastError = new Error(
-        verdict === 'challenge'
-          ? `CLOUDFLARE BLOCK: lnori.com returned a bot-challenge page for ${url}. ` +
-              `Open the novel in the app's webview (or your browser) once to clear it, then retry. ` +
-              `The plugin can't solve Cloudflare's JS challenge.`
-          : `LNORI.com returned a ${body.length}-byte page with no content for ${url} — ` +
-              `likely a transient failure. Retry shortly or via webview.`,
+      throw new Error(
+        `LNORI.com returned an empty or challenge page for ${url}. ` +
+          `Open it once in the app's webview (or a browser), then refresh here.`,
       );
-      if (verdict === 'challenge' || attempt === LnoriComPlugin.FETCH_ATTEMPTS) {
-        throw lastError;
-      }
-      await new Promise(r => setTimeout(r, 700 * attempt));
     }
-    throw lastError;
+    return body;
   }
+
+
+  
 
 
 
