@@ -65,21 +65,18 @@ manifest and offers the update. No need to remove and re-add the repository.
 
 ## Build from source
 
-This repo is a standalone mirror of the plugin. To rebuild the artifacts you need
-Node.js ≥ 22 and the `lnreader-plugins` toolchain available (types, `@libs/*`,
-terser). From the `lnreader-plugins` checkout:
+Requires Node.js ≥ 22. From the repo root:
 
 ```bash
-# validate the plugin against the live API (all four checks must pass)
-npm run check:plugin -- plugins/english/novelarchive.ts
-
-# produce the compiled plugin + manifest
-npx tsc --project tsconfig.production.json
-node build-dist.mjs
+npm install
+npm run build
 ```
 
-`build-dist.mjs` reads the plugin's own `version` field and writes it into the
-manifest, so the two never drift.
+That compiles both plugins (esbuild → terser, CJS with the app-interop
+bridge), gates each bundle on an app-style eval (`id`/`name`/`site`/`lang`/
+`version` must be exposed on the default export — the same fields the app
+copies back into its stored plugin row), and rewrites `.dist/plugins.min.json`
+from the built `version` fields, so manifest and bundles never drift.
 
 ## Notes & limitations
 

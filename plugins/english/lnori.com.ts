@@ -22,7 +22,7 @@ class LnoriComPlugin implements Plugin.PluginBase {
   // Required by the app's PluginItem: the UPDATE path copies name/site/lang
   // from this evaluated module back into the stored plugin row.
   lang = 'English';
-  version = '1.0.16';
+  version = '1.0.17';
   pluginSettings = {
     mergeCoverTitle: {
       label: 'Merge cover + title page into one entry',
@@ -30,88 +30,108 @@ class LnoriComPlugin implements Plugin.PluginBase {
       value: true,
     },
   };
-  // Browser-like headers so Cloudflare's JS bot-challenge (the embedded
-  // challenge-platform script) treats our requests like the webview, which
-  // already passes on the same device/network. The app's default fetchText
-  // sends an Android UA + Accept-Language:* + Sec-Fetch-Mode:cors, a
-  // fingerprint the challenge clears for a real browser but not for a raw
-  // client — that's why webview works and the plugin intermittently doesn't.
-  // We can't run the challenge JS, but matching a browser's header set lets
-  // already-cleared requests (and the webview's clearance cookie context)
-  // ride through instead of being challenged fresh.
-  // Detect a Cloudflare bot-challenge / block interstitial so we can surface a
-  // clear error instead of silently parsing a challenge shell as "0 chapters".
-  // Unambiguous markers only (`cf-mitigated` / "enable JavaScript and
-  // cookies" / "Attention Required"). "Just a moment" alone is rejected
-  // because the novel prose legitimately contains that phrase — we only treat
-  // it as a challenge when the page is tiny (real lnori pages are MB-scale,
-  // challenge shells are a few KB).
-  private assertNotChallenged(body: string, url: string): void {
-    // Structural detection only. Textual markers like "attention required"
-    // FALSE-POSITIVE on novel prose (Re:Zero Vol 14 literally contains
-    // "Special attention required." in a 577 KB chapter page) and made the
-    // whole series return 0 chapters. A real challenge shell is tiny and
-    // carries CF's chrome — match that shape, never bare phrases.
+  // Classify a fetched page so we can surface a clear error instead of
+  // silently parsing a challenge shell as "0 chapters". Structural detection
+  // only: textual markers like "attention required" FALSE-POSITIVE on novel
+  // prose (Re:Zero Vol 14 literally contains "Special attention required."
+  // in a 577 KB chapter page). A real challenge shell is tiny and carries
+  // CF's chrome — match that shape, never bare phrases.
+  // Page-type-aware soft-failure check: series pages legitimately lack
+  // section.chapter/article.card, so those markers alone must not condemn a
+  // small page; every real lnori page carries at least one of the markers below.
+  private classifyResponse(body: string): 'ok' | 'challenge' | 'soft' {
     const isSmall = body.length < 30000;
+    if (!isSmall) return 'ok';
     const title = (body.match(/<title[^>]*>([\s\S]{0,120}?)<\/title>/i)?.[1] ?? '');
     const hasChallengeTitle =
       /just a moment|attention required|please wait|checking your browser/i.test(title);
     if (
-      isSmall &&
-      (/cf-mitigated|cf_chl_opt|cdn-cgi\/challenge\/(?!scripts\/jsd)/.test(body) ||
-        hasChallengeTitle)
+      /cf-mitigated|cf_chl_opt|cdn-cgi\/challenge\/(?!scripts\/jsd)/.test(body) ||
+      hasChallengeTitle
     ) {
-      throw new Error(
-        `CLOUDFLARE BLOCK: lnori.com returned a bot-challenge page for ${url}. ` +
-          `Open the novel in the app's webview (or your browser) once to clear it, then retry. ` +
-          `The plugin can't solve Cloudflare's JS challenge.`,
-      );
+      return 'challenge';
     }
-    // Real lnori pages are hundreds of KB; a tiny non-challenge page is a
-    // soft error worth surfacing rather than parsing into "0 chapters".
-    if (isSmall && !/<section class="chapter"|article\.card/.test(body)) {
-      throw new Error(
-        `LNORI.com returned a ${body.length}-byte page with no content for ${url} — ` +
-          `likely rate-limited. Retry shortly or via webview.`,
-      );
+    if (
+      !/<section class="chapter"|article\.card|class="s-title"|class="hero-card"|class="toc-view"/.test(
+        body,
+      )
+    ) {
+      // Observed in the wild: HTTP 200 with a 0-byte body under load.
+      return 'soft';
     }
+    return 'ok';
   }
 
   // Hard timeout so a held-open socket (Cloudflare tarpit, dead wifi) can
   // never spin the UI forever — the app's fetch has NO timeout of its own.
   private static readonly FETCH_TIMEOUT_MS = 60000;
 
+  // The site intermittently serves HTTP 200 with an empty/truncated body or
+  // drops a socket (observed on a busy session). Quick bounded retries clear
+  // those transients without user-visible errors. Cloudflare challenges are
+  // NOT retried — they never clear by re-requesting.
+  private static readonly FETCH_ATTEMPTS = 3;
+
   private async fetchPage(url: string): Promise<string> {
-    const body = await new Promise<string>((resolve, reject) => {
-      const timer = setTimeout(
-        () => reject(new Error(`LNORI.com timed out after 60s: ${url}`)),
-        LnoriComPlugin.FETCH_TIMEOUT_MS,
+    let lastError = new Error('LNORI.com: fetch did not run');
+    for (let attempt = 1; attempt <= LnoriComPlugin.FETCH_ATTEMPTS; attempt++) {
+      let body: string;
+      try {
+        body = await new Promise<string>((resolve, reject) => {
+          const timer = setTimeout(
+            () => reject(new Error(`LNORI.com timed out after 60s: ${url}`)),
+            LnoriComPlugin.FETCH_TIMEOUT_MS,
+          );
+          fetchText(url, {
+            // Browser-like header set so Cloudflare treats these requests like
+            // the webview, which already passes on the same device/network
+            // (the app's default fingerprint gets challenged fresh).
+            headers: {
+              'User-Agent':
+                'Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36',
+              Accept:
+                'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+              'Accept-Language': 'en-US,en;q=0.9',
+              'Sec-Fetch-Mode': 'navigate',
+              'Sec-Fetch-Dest': 'document',
+              'Sec-Fetch-Site': 'same-origin',
+              Referer: this.site,
+            },
+          }).then(
+            b => {
+              clearTimeout(timer);
+              resolve(b);
+            },
+            e => {
+              clearTimeout(timer);
+              reject(e instanceof Error ? e : new Error(String(e)));
+            },
+          );
+        });
+      } catch (e) {
+        lastError = e instanceof Error ? e : new Error(String(e));
+        if (attempt < LnoriComPlugin.FETCH_ATTEMPTS) {
+          await new Promise(r => setTimeout(r, 700 * attempt));
+          continue;
+        }
+        throw lastError;
+      }
+      const verdict = this.classifyResponse(body);
+      if (verdict === 'ok') return body;
+      lastError = new Error(
+        verdict === 'challenge'
+          ? `CLOUDFLARE BLOCK: lnori.com returned a bot-challenge page for ${url}. ` +
+              `Open the novel in the app's webview (or your browser) once to clear it, then retry. ` +
+              `The plugin can't solve Cloudflare's JS challenge.`
+          : `LNORI.com returned a ${body.length}-byte page with no content for ${url} — ` +
+              `likely a transient failure. Retry shortly or via webview.`,
       );
-      fetchText(url, {
-        headers: {
-          'User-Agent':
-            'Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36',
-          Accept:
-            'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-          'Accept-Language': 'en-US,en;q=0.9',
-          'Sec-Fetch-Mode': 'navigate',
-          'Sec-Fetch-Dest': 'document',
-          'Sec-Fetch-Site': 'same-origin',
-          Referer: this.site,
-        },
-      }).then(
-        b => {
-          clearTimeout(timer);
-          resolve(b);
-        },
-        e => {
-          clearTimeout(timer);
-          reject(e instanceof Error ? e : new Error(String(e)));
-        },
-      );
-    });
-    this.assertNotChallenged(body, url);
-    return body;
+      if (verdict === 'challenge' || attempt === LnoriComPlugin.FETCH_ATTEMPTS) {
+        throw lastError;
+      }
+      await new Promise(r => setTimeout(r, 700 * attempt));
+    }
+    throw lastError;
   }
 
 
@@ -219,26 +239,20 @@ class LnoriComPlugin implements Plugin.PluginBase {
         : coverUrl
       : defaultCover;
 
-    const dataTagsAttr = $('nav.tags-box.desktop').attr('data-tags');
-    if (dataTagsAttr) {
-      try {
-        const parsedTags = JSON.parse(dataTagsAttr);
-        novel.genres = parsedTags
-          .map((t: { name: string }) => t.name)
-          .join(', ');
-      } catch (e) {
-        // Fallback below.
+    // Tags render as <a class="tag"> inside nav.tags-box (the site no longer
+    // serves the old data-tags JSON). Dedupe: desktop and mobile navs carry
+    // the same tags and the old selector matched nodes more than once, which
+    // tripled every genre in the listing.
+    const genres: string[] = [];
+    const seenGenres = new Set<string>();
+    $('nav.tags-box a.tag').each((i, el) => {
+      const key = $(el).text().trim().toLowerCase();
+      if (key && !seenGenres.has(key)) {
+        seenGenres.add(key);
+        genres.push(key);
       }
-    }
-
-    if (!novel.genres) {
-      const genres: string[] = [];
-      $('nav.tags-box.desktop a, nav.tags-box a').each((i, el) => {
-        const text = $(el).text().trim();
-        if (text) genres.push(text);
-      });
-      novel.genres = genres.join(', ');
-    }
+    });
+    novel.genres = genres.join(', ');
 
     const summaryParagraphs: string[] = [];
     $('section.desc-box p.description').each((i, el) => {

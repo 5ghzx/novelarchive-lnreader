@@ -1,0 +1,12 @@
+{
+  "name": "novelarchive-lnreader",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node build-dist.mjs"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.2",
+    "terser": "^5.51.2"
+  }
+}
