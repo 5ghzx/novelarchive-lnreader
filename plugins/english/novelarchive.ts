@@ -116,7 +116,7 @@ class NovelArchivePlugin implements Plugin.PluginBase {
   // nameless source rows (localeCompare crash) were born. Keep in lockstep
   // with the manifest entry build-dist.mjs generates.
   name = 'Novel Archive';
-  version = '1.1.34';
+  version = '1.1.35';
   icon = 'src/en/novelarchive/icon.png';
   site = 'https://novelarchive.cc';
   lang = 'English';
@@ -200,11 +200,18 @@ class NovelArchivePlugin implements Plugin.PluginBase {
   // avoids re-hitting the API on every parseNovel (e.g. library refresh).
   // Per-volume detail fetch cap (ms) during merge, so a single slow/hanging
   // volume can't stall the whole novel ("loading forever").
-  private static readonly VOLUME_TIMEOUT_MS = 8000;
+  private static readonly VOLUME_TIMEOUT_MS = 10000;
+  // How many volume fetches run in parallel during the multi-volume merge.
+  // 15-at-once (one per volume) triggered Cloudflare tarpitting on mobile
+  // networks and silently dropped the losers; 4 keeps the burst small while
+  // still finishing quickly, and each volume now retries on top.
+  private static readonly VOLUME_CONCURRENCY = 4;
   // Concurrency for the eager "skip unavailable" scan: how many chapter
-  // availability probes run in parallel. NovelArchive (Cloudflare) showed no
-  // rate limiting at 150 parallel requests; 64 keeps the burst polite.
-  private static readonly SKIP_CONCURRENCY = 64;
+  // availability probes run in parallel PER VOLUME. Was 64, but combined
+  // with 15 volumes at once that was ~900 requests in a single burst —
+  // self-inflicted Cloudflare tarpitting. 8 × 4 volumes = 32 in flight,
+  // which stays polite and still finishes fast.
+  private static readonly SKIP_CONCURRENCY = 8;
   // Per-chapter availability probe timeout (ms). A probe that exceeds this is
   // treated as "keep" rather than hanging the whole parseNovel (which is what
   // made "Merge volumes" spin forever — 318 chapter probes with no upper
@@ -312,18 +319,31 @@ class NovelArchivePlugin implements Plugin.PluginBase {
           volCount = ids.length;
         }
 
-        const settled = await Promise.allSettled(
-          ids.map(vid => this.fetchVolumeChapters(vid)),
+        // Bounded-concurrency, retrying volume fetch. 15 simultaneous volume
+        // requests — each then fanning out into dozens of availability
+        // probes — is exactly the burst that gets Cloudflare-tarpitted on
+        // flaky networks, and a tarpitted volume used to resolve as EMPTY
+        // and vanish silently ("Konosuba only has volumes 1 and 3").
+        const volumeTasks = ids.map(async vid => {
+          try {
+            return {
+              ok: true as const,
+              chapters: await this.fetchVolumeChapters(vid),
+            };
+          } catch {
+            return { ok: false as const };
+          }
+        });
+        const settled = await this.runWithConcurrency(
+          volumeTasks,
+          NovelArchivePlugin.VOLUME_CONCURRENCY,
         );
-        // A volume that failed (timeout/5xx) contributes ZERO chapters, which
-        // used to silently produce a truncated series (user-visible as "only
-        // Volume 1 exists"). Surface failures instead of swallowing them.
-        const failed = settled.filter(s => s.status === 'rejected').length;
+        const failed = settled.filter(s => s && !s.ok).length;
         const merged: Plugin.ChapterItem[] = [];
         let seq = 0;
         for (const s of settled) {
-          if (s.status !== 'fulfilled') continue;
-          for (const ch of s.value) {
+          if (!s?.ok) continue;
+          for (const ch of s.chapters) {
             seq += 1;
             // Rename BEFORE spreading: the pushed copy must carry the global
             // sequence number, not the per-volume one it was fetched with.
@@ -363,43 +383,57 @@ class NovelArchivePlugin implements Plugin.PluginBase {
   private async fetchVolumeChapters(
     volumeId: string,
   ): Promise<Plugin.ChapterItem[]> {
-    // Cap each volume fetch so a slow/hanging volume can't stall the whole
-    // merged novel (which would show as "loading forever" on-device). We race
-    // the request against a timer and cancel the timer once it settles, so no
-    // dangling timeout is left running. On timeout we treat it as an empty
-    // volume (skipped), never as a hang.
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const request = this.apiGet<NovelResponse>(
-      `/api/novels/${encodeURIComponent(volumeId)}`,
-    );
-    const timeout = new Promise<NovelResponse>(resolve => {
-      timer = setTimeout(() => resolve({}), NovelArchivePlugin.VOLUME_TIMEOUT_MS);
-    });
-    try {
-      const response = await Promise.race([request, timeout]);
-      const novel = response?.novel;
-      if (!novel) return [];
-      const chapters = this.toChapters(volumeId, novel);
-      // Drop empty (404) chapters for THIS volume now, so the merged list the
-      // caller concatenates is already clean — we must not re-scan all ~318
-      // merged chapters again (that second pass is what made "Merge volumes"
-      // spin forever). The probe is time-bounded so a slow API can't stall us.
-      const probed = await this.filterUnavailableChapters(chapters);
-      // Prefix each chapter's display name with its volume number so a merged
-      // multi-volume list reads as one continuous series instead of seventeen
-      // identical "Chapter 1" rows. The path (volumeId/origNumber) is left
-      // untouched so parseChapter still resolves content from the volume that
-      // actually owns the chapter.
-      const vol = this.volumeNumber(novel.title);
-      if (vol > 0) {
-        for (const ch of probed) {
-          ch.name = `Volume ${vol} Chapter ${ch.chapterNumber}`;
+    // Up to 3 attempts with backoff. A timed-out volume used to resolve as an
+    // EMPTY volume — silently dropped from the merged list. Timeouts now
+    // retry, and if every attempt fails the promise REJECTS so the caller's
+    // warning banner reports the loss instead of hiding it.
+    let lastError: unknown;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        const response = await Promise.race([
+          this.apiGet<NovelResponse>(
+            `/api/novels/${encodeURIComponent(volumeId)}`,
+          ),
+          new Promise<never>((_, reject) => {
+            timer = setTimeout(
+              () => reject(new Error(`volume ${volumeId} timed out`)),
+              NovelArchivePlugin.VOLUME_TIMEOUT_MS,
+            );
+          }),
+        ]);
+        const novel = response?.novel;
+        if (!novel) return [];
+        const chapters = this.toChapters(volumeId, novel);
+        // Drop empty (404) chapters for THIS volume now, so the merged list the
+        // caller concatenates is already clean — we must not re-scan all ~318
+        // merged chapters again (that second pass is what made "Merge volumes"
+        // spin forever). The probe is time-bounded so a slow API can't stall us.
+        const probed = await this.filterUnavailableChapters(chapters);
+        // Prefix each chapter's display name with its volume number so a merged
+        // multi-volume list reads as one continuous series instead of seventeen
+        // identical "Chapter 1" rows. The path (volumeId/origNumber) is left
+        // untouched so parseChapter still resolves content from the volume that
+        // actually owns the chapter.
+        const vol = this.volumeNumber(novel.title);
+        if (vol > 0) {
+          for (const ch of probed) {
+            ch.name = `Volume ${vol} Chapter ${ch.chapterNumber}`;
+          }
         }
+        return probed;
+      } catch (e) {
+        lastError = e;
+        if (attempt < 3) {
+          await new Promise(r => setTimeout(r, 600 * attempt));
+        }
+      } finally {
+        if (timer) clearTimeout(timer);
       }
-      return probed;
-    } finally {
-      if (timer) clearTimeout(timer);
     }
+    throw lastError instanceof Error
+      ? lastError
+      : new Error(`volume ${volumeId} failed after 3 attempts`);
   }
   private async probeChapterAvailable(
     novelId: string,
@@ -419,7 +453,14 @@ class NovelArchivePlugin implements Plugin.PluginBase {
         )}/chapters/${encodeURIComponent(String(chapterNumber))}`,
         { headers: { Accept: 'application/json' } },
       );
-      if (!resp.ok) return false;
+      // Drop ONLY on a confirmed 404/410 (chapter genuinely absent). Any other
+      // non-OK (429 rate-limit, 5xx, Cloudflare tarpit response) is
+      // UNVERIFIABLE — the old `if (!resp.ok) return false` mass-dropped every
+      // probed chapter in a volume whenever the burst tripped Cloudflare, and
+      // a volume whose probes all "failed" collapsed to zero rows: the
+      // "series is missing volumes 2, 6-9, 12" bug. Keep on doubt.
+      if (resp.status === 404 || resp.status === 410) return false;
+      if (!resp.ok) return true;
       const data = (await resp.json()) as ChapterResponse;
       return Boolean(data.chapter?.content);
     } catch {
