@@ -9,10 +9,9 @@ import { defaultCover } from '@libs/defaultCover';
 // object between calls, wiping instance fields — that re-downloaded the whole
 // ~1.8 MB / 884-card library page on every Browse page. Survives as long as
 // the module stays loaded in the app session.
-let libraryCache: {
-  items: { novel: Plugin.NovelItem; author: string; tags: string[] }[];
-  at: number;
-} | null = null;
+type LibraryEntry = { novel: Plugin.NovelItem; author: string; tags: string[] };
+
+let libraryCache: { items: LibraryEntry[]; at: number } | null = null;
 
 class LnoriComPlugin implements Plugin.PluginBase {
   id = 'lnori-com';
@@ -22,7 +21,7 @@ class LnoriComPlugin implements Plugin.PluginBase {
   // Required by the app's PluginItem: the UPDATE path copies name/site/lang
   // from this evaluated module back into the stored plugin row.
   lang = 'English';
-  version = '1.0.20';
+  version = '1.0.21';
   pluginSettings = {
     mergeCoverTitle: {
       label: 'Merge cover + title page into one entry',
@@ -30,18 +29,64 @@ class LnoriComPlugin implements Plugin.PluginBase {
       value: true,
     },
   };
-  // IMPORTANT: the network layer here deliberately mirrors the official
-  // LNReader lnori plugin (LNReader/lnreader-plugins, master,
-  // plugins/english/lnori.ts) — one bare fetchText() per page, no custom
-  // headers, NO timeout wrapper, NO retries, NO multi-request bursts. An
-  // earlier version of this plugin added 60s hard timeouts with 3-attempt
-  // retry storms; that request pattern is what kept Cloudflare tarpitting
-  // the app on-device (the official plugin's single, patient request passes
-  // on the same phone and network). The app's fetchText also swallows all
-  // errors and returns '' on failure, so an outage shows up as a small or
-  // empty page rather than a thrown network error.
+  // Network layer deliberately mirrors the official LNReader lnori plugin
+  // (LNReader/lnreader-plugins, master, plugins/english/lnori.ts): one bare
+  // fetchText() per page, app-default headers, NO retries, NO multi-request
+  // bursts. Retry storms and parallel bursts are what push lnori.com's rate
+  // score into its tarpit penalty box — the reported "works right after
+  // install, then times out forever" pattern. Instead of retrying we AVOID
+  // REQUESTS: every page is cached persistently (MMKV via the app's plugin
+  // storage — survives app restarts, which is where the old module-level
+  // cache died and re-downloaded the 1.8 MB library every session) and
+  // served stale whenever the site misbehaves.
+  private static readonly FETCH_TIMEOUT_MS = 60000;
+  private static readonly LIBRARY_TTL_MS = 7 * 24 * 3600 * 1000;
+  private static readonly SERIES_TTL_MS = 12 * 3600 * 1000;
+  private static readonly VOLUME_TTL_MS = 24 * 3600 * 1000;
+  // Chapter pages are immutable once published.
+  private static readonly CHAPTER_TTL_MS = 30 * 24 * 3600 * 1000;
+
+  // Freshness lives INSIDE the value because the app's storage.get() deletes
+  // expired entries on read — using its expires param would make stale data
+  // unavailable exactly when we need it (site down / penalty box active).
+  private cacheGet<T>(key: string, ttlMs: number): { data: T; stale: boolean } | null {
+    try {
+      const hit = storage.get(key) as { v: T; at: number } | undefined;
+      if (!hit || typeof hit.at !== 'number' || hit.v == null) return null;
+      return { data: hit.v, stale: Date.now() - hit.at > ttlMs };
+    } catch {
+      return null; // corrupted entry — treat as missing
+    }
+  }
+
+  private cacheSet<T>(key: string, data: T): void {
+    try {
+      storage.set(key, { v: data, at: Date.now() });
+    } catch {
+      /* caching is best-effort */
+    }
+  }
+
   private async fetchPage(url: string): Promise<string> {
-    const body = await fetchText(url);
+    // Hard 60s ceiling (fork feature: an e-ink spinner must never hang
+    // forever) around a SINGLE patient request — no retries. A timeout or
+    // garbage page falls through to stale-cache fallbacks at the call sites
+    // instead of hammering the site with automatic re-requests.
+    const body = await new Promise<string>((resolve, reject) => {
+      const timer = setTimeout(
+        () => reject(new Error(`LNORI.com timed out after 60s: ${url}`)),
+        LnoriComPlugin.FETCH_TIMEOUT_MS,
+      );
+      fetchText(url)
+        .then(b => {
+          clearTimeout(timer);
+          resolve(b);
+        })
+        .catch(e => {
+          clearTimeout(timer);
+          reject(e instanceof Error ? e : new Error(String(e)));
+        });
+    });
     if (
       body.length < 3000 &&
       !/class="s-title"|class="hero-card"|article\.card|toc-view|section class="chapter"/.test(
@@ -56,25 +101,32 @@ class LnoriComPlugin implements Plugin.PluginBase {
     return body;
   }
 
+  // Library cache: in-memory memo over a PERSISTENT MMKV copy, so app
+  // restarts (constant on e-ink devices) stop re-downloading the full
+  // 1.8 MB / 884-card library page. When the stored copy is expired we serve
+  // it anyway and refresh quietly in the background — Browse stays instant
+  // and the site sees one refresh request per week, not one 1.8 MB fetch
+  // per app start.
+  private async getLibraryNovels(): Promise<LibraryEntry[]> {
+    return this.loadLibrary(false);
+  }
 
-  
-
-
-
-  // Cached library so the app's infinite-scroll Browse doesn't re-download the
-  // full 1.8MB / 884-card library page on every page request (that's what made
-  // the main page hang / load "infinitely"). Fetched once, then paginated from
-  // memory. The cache is cleared on app restart; a manual pull-to-refresh is
-  // unnecessary because the library list itself isn't user-specific.
-
-  private async getLibraryNovels(): Promise<
-    {
-      novel: Plugin.NovelItem;
-      author: string;
-      tags: string[];
-    }[]
-  > {
-    if (libraryCache) return libraryCache.items;
+  private async loadLibrary(force = false): Promise<LibraryEntry[]> {
+    if (!force && libraryCache) return libraryCache.items;
+    const LIBRARY_KEY = 'library';
+    if (!force) {
+      const cached = this.cacheGet<LibraryEntry[]>(
+        LIBRARY_KEY,
+        LnoriComPlugin.LIBRARY_TTL_MS,
+      );
+      if (cached) {
+        libraryCache = { items: cached.data, at: Date.now() };
+        if (cached.stale) {
+          void this.loadLibrary(true).catch(() => {});
+        }
+        return cached.data;
+      }
+    }
     const url = this.site + 'library';
     const body = await this.fetchPage(url);
     const $ = parseHTML(body);
@@ -113,6 +165,7 @@ class LnoriComPlugin implements Plugin.PluginBase {
     });
 
     libraryCache = { items: parsedList, at: Date.now() };
+    this.cacheSet(LIBRARY_KEY, parsedList);
     return parsedList;
   }
 
@@ -149,7 +202,22 @@ class LnoriComPlugin implements Plugin.PluginBase {
 
   async parseNovel(novelPath: string): Promise<Plugin.SourceNovel> {
     const url = this.site + novelPath;
-    const body = await this.fetchPage(url);
+    // Series page: persistent cache (12h) with stale-serve + quiet background
+    // refresh, so reopening a book during a tarpit window still works.
+    const seriesKey = 'series' + novelPath;
+    let body: string;
+    const cachedSeries = this.cacheGet<string>(seriesKey, LnoriComPlugin.SERIES_TTL_MS);
+    if (cachedSeries) {
+      body = cachedSeries.data;
+      if (cachedSeries.stale) {
+        void this.fetchPage(url)
+          .then(fresh => this.cacheSet(seriesKey, fresh))
+          .catch(() => {});
+      }
+    } else {
+      body = await this.fetchPage(url);
+      this.cacheSet(seriesKey, body);
+    }
     const $ = parseHTML(body);
 
     const novel: Plugin.SourceNovel = {
@@ -259,22 +327,56 @@ class LnoriComPlugin implements Plugin.PluginBase {
     // indexed results). Purely-sequential fetching made a 17-volume series
     // wait on 17 serialized ~350 KB pages; 4-way keeps RAM pressure low for
     // e-ink devices while cutting wall time to roughly a quarter.
-    const results: Plugin.ChapterItem[][] = new Array(volumeUrls.length);
+    // Volume pages: persistent per-volume cache (24h). Only volumes missing
+    // from cache hit the network; a volume whose fetch fails is served from
+    // its stale copy instead of vanishing (the Konosuba missing-volume bug
+    // must never come back through a transient timeout).
+    const results: (Plugin.ChapterItem[] | undefined)[] = new Array(volumeUrls.length);
     let cursor = 0;
+    const loadVolume = async (idx: number): Promise<void> => {
+      const volUrl = volumeUrls[idx];
+      const volKey = 'vol' + volUrl;
+      const fullVolUrl = this.site.replace(/\/$/, '') + volUrl;
+      const cachedVol = this.cacheGet<Plugin.ChapterItem[]>(
+        volKey,
+        LnoriComPlugin.VOLUME_TTL_MS,
+      );
+      if (cachedVol && !cachedVol.stale) {
+        results[idx] = cachedVol.data;
+        return;
+      }
+      try {
+        const $vol = parseHTML(await this.fetchPage(fullVolUrl));
+        const parsed = parseVolume($vol, volUrl);
+        results[idx] = parsed;
+        this.cacheSet(volKey, parsed);
+      } catch (e) {
+        if (cachedVol) {
+          results[idx] = cachedVol.data; // stale list beats a missing volume
+          return;
+        }
+        throw new Error(
+          `LNORI.com: could not load a volume of this series (${volUrl}) and no ` +
+            `cached copy exists yet. Try again later, or open the series once in a browser.`,
+        );
+      }
+    };
     const workers = Array.from(
       { length: Math.min(4, volumeUrls.length) },
       async () => {
         while (cursor < volumeUrls.length) {
           const idx = cursor++;
-          const volUrl = volumeUrls[idx];
-          const fullVolUrl = this.site.replace(/\/$/, '') + volUrl;
-          const $vol = parseHTML(await this.fetchPage(fullVolUrl));
-          results[idx] = parseVolume($vol, volUrl);
+          await loadVolume(idx);
         }
       },
     );
-    await Promise.all(workers);
-    let chapters: Plugin.ChapterItem[] = results.flat();
+    const settled = await Promise.allSettled(workers);
+    for (const s of settled) {
+      if (s.status === 'rejected') {
+        throw s.reason instanceof Error ? s.reason : new Error(String(s.reason));
+      }
+    }
+    let chapters: Plugin.ChapterItem[] = results.map(r => r ?? []).flat();
 
     // Toggle (default on): fold front/back-matter pages into one entry PER
     // VOLUME. Real series data (e.g. lnori Konosuba, 17 volumes) shows every
@@ -349,7 +451,18 @@ class LnoriComPlugin implements Plugin.PluginBase {
     // ("page01,page02"); render each section and concatenate.
     const anchors = (anchorRaw || '').split(',').filter(Boolean);
     const url = this.site.replace(/\/$/, '') + '/' + pathWithoutAnchor;
-    const body = await this.fetchPage(url);
+    // Chapter pages never change once published: cache for 30 days so
+    // re-reading (and tarpit windows) never touches the network. Cap stored
+    // size to keep MMKV lean.
+    const chapKey = 'chap' + chapterPath;
+    let body: string;
+    const cachedChap = this.cacheGet<string>(chapKey, LnoriComPlugin.CHAPTER_TTL_MS);
+    if (cachedChap) {
+      body = cachedChap.data;
+    } else {
+      body = await this.fetchPage(url);
+      if (body.length < 800000) this.cacheSet(chapKey, body);
+    }
     const $ = parseHTML(body);
 
     const tocAnchors: string[] = [];
