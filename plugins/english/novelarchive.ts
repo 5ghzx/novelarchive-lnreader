@@ -135,7 +135,7 @@ class NovelArchivePlugin implements Plugin.PluginBase {
   // nameless source rows (localeCompare crash) were born. Keep in lockstep
   // with the manifest entry build-dist.mjs generates.
   name = 'Novel Archive';
-  version = '1.1.44';
+  version = '1.1.45';
   icon = 'src/en/novelarchive/icon.png';
   site = 'https://novelarchive.cc';
   lang = 'English';
@@ -869,38 +869,37 @@ class NovelArchivePlugin implements Plugin.PluginBase {
     }));
   }
   // Run async tasks with a bounded concurrency limit, preserving input order.
+  // Runs promise-producing tasks with bounded concurrency. EVERY slot of the
+  // result array is always written: a task that rejects stores `undefined`,
+  // and no slot can be left unassigned. The previous callback-chained version
+  // could leave a SPARSE HOLE (confirmed on-device: index 0 of 17), and holes
+  // are skipped by Array.prototype.filter/map — so a whole volume vanished
+  // while `lost` stayed 0 and the banner happily reported 17/17. Missing vs
+  // failed matters here: callers rely on `!result` to count and retry losses.
   private async runWithConcurrency<T>(
     tasks: Promise<T>[],
     limit: number,
   ): Promise<T[]> {
-    let resolve!: (v: T[]) => void;
-    const promise = new Promise<T[]>(res => {
-      resolve = res;
-    });
-    if (tasks.length === 0) return [];
-    const results: T[] = new Array(tasks.length);
-    let active = 0;
+    const results: (T | undefined)[] = new Array(tasks.length).fill(
+      undefined,
+    );
     let cursor = 0;
-    const next = () => {
-      while (active < limit && cursor < tasks.length) {
+    const worker = async () => {
+      for (;;) {
         const i = cursor++;
-        active++;
-        tasks[i]
-          .then(v => {
-            results[i] = v;
-          })
-          .catch(() => {
-            results[i] = undefined as T;
-          })
-          .finally(() => {
-            active--;
-            if (cursor >= tasks.length && active === 0) resolve(results);
-            else next();
-          });
+        if (i >= tasks.length) return;
+        try {
+          results[i] = await tasks[i];
+        } catch {
+          results[i] = undefined;
+        }
       }
     };
-    next();
-    return promise;
+    const workerCount = Math.max(1, Math.min(limit, tasks.length));
+    await Promise.all(
+      Array.from({ length: workerCount }, () => worker()),
+    );
+    return results as T[];
   }
 
   async parseChapter(chapterPath: string): Promise<string> {
