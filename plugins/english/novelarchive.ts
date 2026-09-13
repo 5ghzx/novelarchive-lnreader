@@ -116,7 +116,7 @@ class NovelArchivePlugin implements Plugin.PluginBase {
   // nameless source rows (localeCompare crash) were born. Keep in lockstep
   // with the manifest entry build-dist.mjs generates.
   name = 'Novel Archive';
-  version = '1.1.35';
+  version = '1.1.36';
   icon = 'src/en/novelarchive/icon.png';
   site = 'https://novelarchive.cc';
   lang = 'English';
@@ -538,24 +538,20 @@ class NovelArchivePlugin implements Plugin.PluginBase {
       (a, b) => Number(a) - Number(b),
     );
 
-    // Create one mega chapter per (non-empty) volume, each carrying the
-    // already-cleaned, renumbered chapter list so its content build skips
-    // empties and emits sequential headers.
+    // Create one mega chapter per (non-empty) volume. The path is STABLE
+    // ("volumeId/M/V<vol>") and carries NO per-chapter data: the chapter list
+    // is resolved live at open time. The previous format embedded the probed
+    // chapter numbers in the path; probe verdicts legitimately vary between
+    // refreshes ("keep on doubt"), so the path changed and LNReader's
+    // (novelId, path) upsert — which never deletes rows missing from a later
+    // list — kept the old row too: the duplicate "Volume 1 (Full)" bug.
     const mega: Plugin.ChapterItem[] = [];
     for (const vol of sortedVols) {
       const volChapters = byVolume.get(vol)!;
-      const first = volChapters[0];
-      const volumeId = first.path.split('/')[0];
-      // Encode the volume number AND the cleaned chapter numbers into the
-      // path itself — NOT an in-memory cache. LNReader may re-instantiate the
-      // plugin between parseNovel and parseChapter, which would wipe an
-      // instance cache and leave every mega chapter empty. With the data in
-      // the path, parseChapter rebuilds content statelessly (and can label
-      // each <h2> as "Volume N Chapter X").
-      const nums = volChapters.map(c => c.path.split('/')[1]).join(',');
+      const volumeId = volChapters[0].path.split('/')[0];
       mega.push({
         name: `Volume ${vol} (Full)`,
-        path: `${volumeId}/M/V${vol}/${nums}`,
+        path: `${volumeId}/M/V${vol}`,
         chapterNumber: mega.length + 1,
       });
     }
@@ -590,6 +586,45 @@ class NovelArchivePlugin implements Plugin.PluginBase {
     })());
     const parts = await this.runWithConcurrency(tasks, 8);
     return parts.filter((p): p is string => p !== null).join('\n<hr/>\n');
+  }
+
+  // Resolve a stable mega path ("volumeId/M/V<vol>") to its chapter list at
+  // open time: fetch the volume's chapter names from the API, then drop the
+  // chapters the availability probe confirms are empty. The probe is
+  // best-effort (a failed/timeout probe KEEPS the chapter, and
+  // fetchAndConcat skips late 404s while renumbering headers), so a flaky
+  // connection can at worst add a "<missing>" header — it can never
+  // duplicate or remove a chapter row, because the mega path itself is
+  // constant across refreshes.
+  private async fetchVolumeChapterList(
+    volumeId: string,
+    vol: string,
+  ): Promise<Plugin.ChapterItem[]> {
+    const response = await this.apiGet<NovelResponse>(
+      `/api/novels/${encodeURIComponent(volumeId)}`,
+    );
+    const chapters = this.toChapters(volumeId, response?.novel ?? {});
+    if (!chapters.length) {
+      throw new Error(`NovelArchive volume not found: ${volumeId}`);
+    }
+    const tasks = chapters.map(async ch => {
+      const num = ch.path.split('/')[1];
+      const available = await this.probeChapterAvailable(
+        volumeId,
+        Number(num),
+      );
+      return available ? ch : null;
+    });
+    const settled = await this.runWithConcurrency(
+      tasks,
+      NovelArchivePlugin.SKIP_CONCURRENCY,
+    );
+    const kept = settled.filter((c): c is Plugin.ChapterItem => c !== null);
+    return kept.map((ch, n) => ({
+      ...ch,
+      chapterNumber: n + 1,
+      name: `Volume ${vol} Chapter ${n + 1}`,
+    }));
   }
   // Run async tasks with a bounded concurrency limit, preserving input order.
   private async runWithConcurrency<T>(
@@ -626,19 +661,33 @@ class NovelArchivePlugin implements Plugin.PluginBase {
   }
 
   async parseChapter(chapterPath: string): Promise<string> {
-    // Mega chapter path format: "volumeId/M/num1,num2,..." (M = mega). The
-    // cleaned chapter numbers are encoded in the path so content builds
-    // statelessly (no instance cache that LNReader might wipe between
-    // parseNovel and parseChapter).
-    const m = chapterPath.match(/^(.+)\/M\/V(\d+)\/(.+)$/);
-    if (m) {
-      const volumeId = m[1];
-      const vol = m[2];
-      const nums = m[3].split(',').filter(Boolean);
-      const chapters = nums.map(num => ({
-        path: `${volumeId}/${num}`,
-        name: `Volume ${vol} Chapter ${num}`,
-      }));
+    // Mega chapter paths. STABLE format: "volumeId/M/V<vol>" — deliberately
+    // carries NO per-chapter data. LNReader's library upserts chapters keyed
+    // by (novelId, path) and never deletes rows that vanish from a later
+    // parse, so any probe-dependent data in the path (the chapter-number list
+    // this used to embed) mints a brand-new row on the next refresh whenever
+    // the probe verdicts differ — the duplicate "Volume 1 (Full)" bug. The
+    // path therefore never changes between refreshes; content is resolved
+    // live in fetchVolumeChapterList.
+    const stableMega = chapterPath.match(/^(.+)\/M\/V(\d+)$/);
+    if (stableMega) {
+      const [, volumeId, vol] = stableMega;
+      const chapters = await this.fetchVolumeChapterList(volumeId, vol);
+      return this.fetchAndConcatVolumeChapters(volumeId, chapters);
+    }
+    // LEGACY format (<= 1.1.35): "volumeId/M/V<vol>/num1,num2,..." already
+    // persisted in existing libraries — still parseable so old mega rows
+    // keep opening after the update.
+    const legacyMega = chapterPath.match(/^(.+)\/M\/V(\d+)\/(.+)$/);
+    if (legacyMega) {
+      const [, volumeId, vol, nums] = legacyMega;
+      const chapters = nums
+        .split(',')
+        .filter(Boolean)
+        .map(num => ({
+          path: `${volumeId}/${num}`,
+          name: `Volume ${vol} Chapter ${num}`,
+        }));
       return this.fetchAndConcatVolumeChapters(volumeId, chapters);
     }
     const [pathWithoutAnchor, anchor] = chapterPath.split('#');
