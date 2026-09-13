@@ -135,7 +135,7 @@ class NovelArchivePlugin implements Plugin.PluginBase {
   // nameless source rows (localeCompare crash) were born. Keep in lockstep
   // with the manifest entry build-dist.mjs generates.
   name = 'Novel Archive';
-  version = '1.1.37';
+  version = '1.1.38';
   icon = 'src/en/novelarchive/icon.png';
   site = 'https://novelarchive.cc';
   lang = 'English';
@@ -360,7 +360,13 @@ class NovelArchivePlugin implements Plugin.PluginBase {
           volumeTasks,
           NovelArchivePlugin.VOLUME_CONCURRENCY,
         );
-        const failed = settled.filter(s => s && !s.ok).length;
+        const failed = settled.filter(s => !s || !s.ok).length;
+        // A volume that fetched "successfully" but contributed ZERO chapters
+        // is just as lost as a failed one — count it honestly.
+        const empty = settled.filter(s => s && s.ok && !s.chapters.length)
+          .length;
+        const lost = failed + empty;
+        const contributed = ids.length - lost;
         // Volumes kept alive by their cached copy are NOT failures (the list
         // is complete), but the reader should know those rows may be stale.
         const staleCount = staleVolumes.size;
@@ -381,15 +387,16 @@ class NovelArchivePlugin implements Plugin.PluginBase {
         }
         if (merged.length) {
           novel.chapters = merged;
-          let banner = `[${volCount} volumes merged — ${merged.length} chapters total]`;
-          if (failed > 0) {
-            banner += ` — WARNING: ${failed} volume(s) failed to load; refresh to retry`;
+          let banner = `[${contributed}/${volCount} volumes — ${merged.length} chapters]`;
+          if (lost > 0) {
+            banner += ` — WARNING: ${lost} volume(s) returned nothing; refresh to retry`;
           } else if (staleCount > 0) {
             banner += ` — ${staleCount} volume(s) served from cache (site busy)`;
           }
           novel.summary = `${banner}\n` + (novel.summary ?? '');
-        } else if (failed > 0) {
-          // Every volume failed — do NOT leave a stale/partial list behind.
+        } else if (lost > 0) {
+          // Every volume lost (failed or empty) — do NOT leave a stale/partial
+          // list behind.
           throw new Error(
             `All ${volCount} volumes failed to load — check connection, then refresh the novel.`,
           );
@@ -480,7 +487,17 @@ class NovelArchivePlugin implements Plugin.PluginBase {
           }),
         ]);
         const novel = response?.novel;
-        if (!novel) return [];
+        // A degraded response (200 with an empty/missing novel body — common
+        // on-device under load) is an ERROR, not an empty volume: returning []
+        // here silently vanished whole volumes ("no Volume 1") while the
+        // banner kept counting them. Throw so it retries, then stale-serves.
+        if (
+          !novel ||
+          !Array.isArray(novel.chapter_names) ||
+          novel.chapter_names.length === 0
+        ) {
+          throw new Error(`volume ${volumeId}: degraded response`);
+        }
         const chapters = this.toChapters(volumeId, novel);
         const probed = await this.probeWithCache(volumeId, chapters);
         // Prefix each chapter's display name with its volume number so a merged
@@ -546,16 +563,15 @@ class NovelArchivePlugin implements Plugin.PluginBase {
         )}/chapters/${encodeURIComponent(String(chapterNumber))}`,
         { headers: { Accept: 'application/json' } },
       );
-      // Drop ONLY on a confirmed 404/410 (chapter genuinely absent). Any other
-      // non-OK (429 rate-limit, 5xx, Cloudflare tarpit response) is
-      // UNVERIFIABLE — the old `if (!resp.ok) return false` mass-dropped every
-      // probed chapter in a volume whenever the burst tripped Cloudflare, and
-      // a volume whose probes all "failed" collapsed to zero rows: the
-      // "series is missing volumes 2, 6-9, 12" bug. Keep on doubt.
+      // Drop ONLY on a confirmed 404/410 (chapter genuinely absent — the API
+      // answers real "Chapter does not exist" cases with exactly this). Any
+      // other outcome is UNVERIFIABLE and keeps the chapter: 429/5xx (rate
+      // limiting), network errors, and DEGRADED 200s. That last one was the
+      // on-device "170 of 321 chapters / no Volume 1" bug — under load the
+      // API returns 200 bodies with no chapter payload, and treating those
+      // as confirmed absence mass-deleted chapters and whole volumes.
       if (resp.status === 404 || resp.status === 410) return false;
-      if (!resp.ok) return true;
-      const data = (await resp.json()) as ChapterResponse;
-      return Boolean(data.chapter?.content);
+      return true;
     } catch {
       // Network error / unverifiable -> keep the chapter.
       return true;
