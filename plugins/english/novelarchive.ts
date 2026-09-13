@@ -109,6 +109,25 @@ const CHAPTER_NAME_RE = /^chapter\s*(\d+)/i;
 const searchSeen = new Set<string>();
 const seriesVolumes = new Map<string, string[]>();
 
+// Session-level memo of each volume's last GOOD (empty-dropped, renumbered)
+// chapter list. MMKV (storage) is the durable layer; this Map is the fast
+// copy. LNReader's library upserts chapters by (novelId, path) and NEVER
+// deletes rows that vanish from a later parse — so a volume whose fetch
+// fails during a refresh must contribute its last good list, not silence
+// (the "missing volumes" bug: the device lost Vols 1/2/3 of Konosuba in one
+// refresh while the server data was verified complete; the loss was purely
+// transport). Stale data beats vanished data.
+const volumeChapterCache = new Map<string, Plugin.ChapterItem[]>();
+// Session memo of each volume's last-scanned RAW signature (parallel to
+// volumeChapterCache) so probeWithCache can sig-hit within a session too —
+// the base volume is probed in STEP 1 and would otherwise be scanned AGAIN
+// when the merge loop reaches it (10 wasted probes per novel).
+const volumeSigMemo = new Map<string, string>();
+// Volume ids kept alive by their cached copy during the CURRENT parse
+// (cleared at the start of each merge) — powers the "served from cache"
+// banner note.
+const staleVolumes = new Set<string>();
+
 class NovelArchivePlugin implements Plugin.PluginBase {
   id = 'novelarchive';
   // REQUIRED by the app's update path: it overwrites the stored row's
@@ -116,7 +135,7 @@ class NovelArchivePlugin implements Plugin.PluginBase {
   // nameless source rows (localeCompare crash) were born. Keep in lockstep
   // with the manifest entry build-dist.mjs generates.
   name = 'Novel Archive';
-  version = '1.1.36';
+  version = '1.1.37';
   icon = 'src/en/novelarchive/icon.png';
   site = 'https://novelarchive.cc';
   lang = 'English';
@@ -267,7 +286,9 @@ class NovelArchivePlugin implements Plugin.PluginBase {
     // is on, rediscover every sibling volume via search and concatenate all
     // STEP 1: Drop empty (404) chapters from this base volume and renumber.
     // Always on — a 404 chapter is unusable, so it never belongs in the list.
-    novel.chapters = await this.filterUnavailableChapters(novel.chapters);
+    // (Skipped entirely when this volume's chapter set is unchanged since its
+    // last successful scan — see probeWithCache.)
+    novel.chapters = await this.probeWithCache(id, novel.chapters);
 
     // STEP 2: Merge sibling volumes into one series (if enabled).
     if (storage.get('mergeSeries')) {
@@ -324,11 +345,12 @@ class NovelArchivePlugin implements Plugin.PluginBase {
         // probes — is exactly the burst that gets Cloudflare-tarpitted on
         // flaky networks, and a tarpitted volume used to resolve as EMPTY
         // and vanish silently ("Konosuba only has volumes 1 and 3").
+        staleVolumes.clear();
         const volumeTasks = ids.map(async vid => {
           try {
             return {
               ok: true as const,
-              chapters: await this.fetchVolumeChapters(vid),
+              chapters: await this.getVolumeChapters(vid),
             };
           } catch {
             return { ok: false as const };
@@ -339,6 +361,10 @@ class NovelArchivePlugin implements Plugin.PluginBase {
           NovelArchivePlugin.VOLUME_CONCURRENCY,
         );
         const failed = settled.filter(s => s && !s.ok).length;
+        // Volumes kept alive by their cached copy are NOT failures (the list
+        // is complete), but the reader should know those rows may be stale.
+        const staleCount = staleVolumes.size;
+        staleVolumes.clear();
         const merged: Plugin.ChapterItem[] = [];
         let seq = 0;
         for (const s of settled) {
@@ -358,6 +384,8 @@ class NovelArchivePlugin implements Plugin.PluginBase {
           let banner = `[${volCount} volumes merged — ${merged.length} chapters total]`;
           if (failed > 0) {
             banner += ` — WARNING: ${failed} volume(s) failed to load; refresh to retry`;
+          } else if (staleCount > 0) {
+            banner += ` — ${staleCount} volume(s) served from cache (site busy)`;
           }
           novel.summary = `${banner}\n` + (novel.summary ?? '');
         } else if (failed > 0) {
@@ -380,13 +408,62 @@ class NovelArchivePlugin implements Plugin.PluginBase {
     return novel;
   }
 
-  private async fetchVolumeChapters(
+  // Signature of a volume's raw chapter set: count + name list. Same
+  // signature => same server data => the availability probe (which only
+  // separates server-confirmed 404s from content) cannot yield a different
+  // result, so it is SKIPPED and the persisted scan is reused. Removes ~19
+  // probes per volume from every refresh (Konosuba: ~300 requests -> ~17),
+  // which is what kept tripping the site's rate limiter and wiping volumes.
+  private probeSignature(chapters: Plugin.ChapterItem[]): string {
+    return `${chapters.length}:${chapters.map(c => c.name).join('|')}`;
+  }
+
+  private readProbeStore(
+    volumeId: string,
+  ): { sig: string; chapters: Plugin.ChapterItem[] } | undefined {
+    try {
+      const cached = storage.get(`naprobe:${volumeId}`) as
+        | { sig: string; chapters: Plugin.ChapterItem[] }
+        | undefined;
+      if (cached && typeof cached.sig === 'string' && Array.isArray(cached.chapters)) {
+        return cached;
+      }
+    } catch {
+      /* corrupted entry — rescan */
+    }
+    return undefined;
+  }
+
+  // Availability scan with persistence: when the raw chapter set is unchanged
+  // since the last successful scan, reuse it; otherwise scan and persist.
+  private async probeWithCache(
+    volumeId: string,
+    raw: Plugin.ChapterItem[],
+  ): Promise<Plugin.ChapterItem[]> {
+    const sig = this.probeSignature(raw);
+    const cached = this.readProbeStore(volumeId);
+    if (cached && cached.sig === sig) {
+      volumeChapterCache.set(volumeId, cached.chapters);
+      return cached.chapters;
+    }
+    // Session-level sig hit: same raw set already scanned this session.
+    if (volumeSigMemo.get(volumeId) === sig) {
+      const memo = volumeChapterCache.get(volumeId);
+      if (memo) return memo;
+    }
+    const scanned = await this.filterUnavailableChapters(raw);
+    volumeChapterCache.set(volumeId, scanned);
+    volumeSigMemo.set(volumeId, sig);
+    // NOTE: persistence happens ONLY with display-ready (renamed) lists in
+    // getVolumeChapters, so a sig-hit can never return an intermediate form.
+    return scanned;
+  }
+
+  // Fetch one volume's chapter list with retries; on total failure serve the
+  // last good cached copy (session memo or persisted) instead of vanishing.
+  private async getVolumeChapters(
     volumeId: string,
   ): Promise<Plugin.ChapterItem[]> {
-    // Up to 3 attempts with backoff. A timed-out volume used to resolve as an
-    // EMPTY volume — silently dropped from the merged list. Timeouts now
-    // retry, and if every attempt fails the promise REJECTS so the caller's
-    // warning banner reports the loss instead of hiding it.
     let lastError: unknown;
     for (let attempt = 1; attempt <= 3; attempt++) {
       let timer: ReturnType<typeof setTimeout> | undefined;
@@ -405,11 +482,7 @@ class NovelArchivePlugin implements Plugin.PluginBase {
         const novel = response?.novel;
         if (!novel) return [];
         const chapters = this.toChapters(volumeId, novel);
-        // Drop empty (404) chapters for THIS volume now, so the merged list the
-        // caller concatenates is already clean — we must not re-scan all ~318
-        // merged chapters again (that second pass is what made "Merge volumes"
-        // spin forever). The probe is time-bounded so a slow API can't stall us.
-        const probed = await this.filterUnavailableChapters(chapters);
+        const probed = await this.probeWithCache(volumeId, chapters);
         // Prefix each chapter's display name with its volume number so a merged
         // multi-volume list reads as one continuous series instead of seventeen
         // identical "Chapter 1" rows. The path (volumeId/origNumber) is left
@@ -421,6 +494,17 @@ class NovelArchivePlugin implements Plugin.PluginBase {
             ch.name = `Volume ${vol} Chapter ${ch.chapterNumber}`;
           }
         }
+        // Persist the FINAL (renamed) list under the raw signature so the
+        // stale-serve path and the sig-hit path both return display-ready rows.
+        volumeChapterCache.set(volumeId, probed);
+        try {
+          storage.set(`naprobe:${volumeId}`, {
+            sig: this.probeSignature(chapters),
+            chapters: probed,
+          });
+        } catch {
+          /* caching is best-effort */
+        }
         return probed;
       } catch (e) {
         lastError = e;
@@ -430,6 +514,15 @@ class NovelArchivePlugin implements Plugin.PluginBase {
       } finally {
         if (timer) clearTimeout(timer);
       }
+    }
+    // All attempts failed. Serve the last good list if we have one — the app
+    // never deletes library rows, but it also never re-inserts rows a parse
+    // stops returning, so silence here is PERMANENT loss on the device.
+    const stale = volumeChapterCache.get(volumeId) ??
+      this.readProbeStore(volumeId)?.chapters;
+    if (stale && stale.length) {
+      staleVolumes.add(volumeId);
+      return stale;
     }
     throw lastError instanceof Error
       ? lastError
