@@ -135,7 +135,7 @@ class NovelArchivePlugin implements Plugin.PluginBase {
   // nameless source rows (localeCompare crash) were born. Keep in lockstep
   // with the manifest entry build-dist.mjs generates.
   name = 'Novel Archive';
-  version = '1.1.40';
+  version = '1.1.41';
   icon = 'src/en/novelarchive/icon.png';
   site = 'https://novelarchive.cc';
   lang = 'English';
@@ -427,6 +427,12 @@ class NovelArchivePlugin implements Plugin.PluginBase {
     return `${chapters.length}:${chapters.map(c => c.name).join('|')}`;
   }
 
+  // Chapter count encoded at the front of a probe signature.
+  private sigCount(sig: string): number {
+    const n = parseInt(sig, 10);
+    return Number.isFinite(n) ? n : 0;
+  }
+
   private readProbeStore(
     volumeId: string,
   ): { sig: string; chapters: Plugin.ChapterItem[] } | undefined {
@@ -452,6 +458,18 @@ class NovelArchivePlugin implements Plugin.PluginBase {
     const sig = this.probeSignature(raw);
     const cached = this.readProbeStore(volumeId);
     if (cached && cached.sig === sig) {
+      volumeChapterCache.set(volumeId, cached.chapters);
+      return cached.chapters;
+    }
+    // Degraded-detail guard: under load the API returns 200s with a TRUNCATED
+    // chapter_names list (a shrunken TOC, not an empty one — that empty case
+    // is handled in getVolumeChapters). The site never deletes TOC entries;
+    // genuinely dead chapters still appear in the list and are handled by the
+    // 404 probe. So a raw list SHORTER than the last good scan can only be
+    // degradation, never real data: serve the persisted complete list and keep
+    // the longer store entry. Letting the shrink through is what cut Konosuba
+    // to 191 of 323 chapters on-device while every volume "succeeded".
+    if (cached && this.sigCount(cached.sig) > raw.length) {
       volumeChapterCache.set(volumeId, cached.chapters);
       return cached.chapters;
     }
@@ -517,10 +535,16 @@ class NovelArchivePlugin implements Plugin.PluginBase {
         // stale-serve path and the sig-hit path both return display-ready rows.
         volumeChapterCache.set(volumeId, probed);
         try {
-          storage.set(`naprobe:${volumeId}`, {
-            sig: this.probeSignature(chapters),
-            chapters: probed,
-          });
+          // Never overwrite a longer good scan with a degraded shorter one —
+          // the persisted complete list is the fallback every later refresh
+          // relies on. Equal counts still rewrite (name/renumber updates).
+          const prev = this.readProbeStore(volumeId);
+          if (!prev || this.sigCount(prev.sig) <= chapters.length) {
+            storage.set(`naprobe:${volumeId}`, {
+              sig: this.probeSignature(chapters),
+              chapters: probed,
+            });
+          }
         } catch {
           /* caching is best-effort */
         }
