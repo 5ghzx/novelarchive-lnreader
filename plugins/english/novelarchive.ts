@@ -135,7 +135,7 @@ class NovelArchivePlugin implements Plugin.PluginBase {
   // nameless source rows (localeCompare crash) were born. Keep in lockstep
   // with the manifest entry build-dist.mjs generates.
   name = 'Novel Archive';
-  version = '1.1.39';
+  version = '1.1.40';
   icon = 'src/en/novelarchive/icon.png';
   site = 'https://novelarchive.cc';
   lang = 'English';
@@ -221,16 +221,18 @@ class NovelArchivePlugin implements Plugin.PluginBase {
   // volume can't stall the whole novel ("loading forever").
   private static readonly VOLUME_TIMEOUT_MS = 10000;
   // How many volume fetches run in parallel during the multi-volume merge.
-  // 15-at-once (one per volume) triggered Cloudflare tarpitting on mobile
-  // networks and silently dropped the losers; 4 keeps the burst small while
-  // still finishing quickly, and each volume now retries on top.
-  private static readonly VOLUME_CONCURRENCY = 4;
+  // On-device testing showed the edge degrades (truncated payloads, hung
+  // responses) even at 4 concurrent volume fetches, while every desktop run
+  // passes; 2 keeps the in-flight count minimal. Slower, but a clean parse
+  // beats a fast broken one, and unchanged volumes skip probes anyway.
+  private static readonly VOLUME_CONCURRENCY = 2;
   // Concurrency for the eager "skip unavailable" scan: how many chapter
-  // availability probes run in parallel PER VOLUME. Was 64, but combined
-  // with 15 volumes at once that was ~900 requests in a single burst —
-  // self-inflicted Cloudflare tarpitting. 8 × 4 volumes = 32 in flight,
-  // which stays polite and still finishes fast.
-  private static readonly SKIP_CONCURRENCY = 8;
+  // availability probes run in parallel PER VOLUME. Was 64 → 8 after the
+  // burst-tarpit findings, now 4: with 2 volume fetches in flight that is
+  // at most 8 concurrent requests total, which on-device testing showed is
+  // the profile the edge tolerates. First parse of a big series takes a few
+  // minutes; every later refresh is probe-free via the signature cache.
+  private static readonly SKIP_CONCURRENCY = 4;
   // Per-chapter availability probe timeout (ms). A probe that exceeds this is
   // treated as "keep" rather than hanging the whole parseNovel (which is what
   // made "Merge volumes" spin forever — 318 chapter probes with no upper
