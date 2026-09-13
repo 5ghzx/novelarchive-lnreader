@@ -135,7 +135,7 @@ class NovelArchivePlugin implements Plugin.PluginBase {
   // nameless source rows (localeCompare crash) were born. Keep in lockstep
   // with the manifest entry build-dist.mjs generates.
   name = 'Novel Archive';
-  version = '1.1.42';
+  version = '1.1.43';
   icon = 'src/en/novelarchive/icon.png';
   site = 'https://novelarchive.cc';
   lang = 'English';
@@ -348,20 +348,37 @@ class NovelArchivePlugin implements Plugin.PluginBase {
         // flaky networks, and a tarpitted volume used to resolve as EMPTY
         // and vanish silently ("Konosuba only has volumes 1 and 3").
         staleVolumes.clear();
-        const volumeTasks = ids.map(async vid => {
-          try {
-            return {
-              ok: true as const,
-              chapters: await this.getVolumeChapters(vid),
-            };
-          } catch {
-            return { ok: false as const };
-          }
-        });
-        const settled = await this.runWithConcurrency(
-          volumeTasks,
-          NovelArchivePlugin.VOLUME_CONCURRENCY,
-        );
+        const fetchVolumes = (list: string[]) =>
+          this.runWithConcurrency(
+            list.map(async vid => {
+              try {
+                return {
+                  ok: true as const,
+                  chapters: await this.getVolumeChapters(vid),
+                };
+              } catch {
+                return { ok: false as const };
+              }
+            }),
+            NovelArchivePlugin.VOLUME_CONCURRENCY,
+          );
+        const settled = await fetchVolumes(ids);
+        // Rescue pass: a volume that failed outright (degraded edge during its
+        // 3 attempts) must not silently cost the reader a whole volume. Once
+        // the other volumes have settled — which itself takes a while and
+        // gives the edge time to breathe — retry ONLY the failures once.
+        const failedIndexes = settled
+          .map((s, i) => (!s || !s.ok ? i : -1))
+          .filter(i => i >= 0);
+        if (failedIndexes.length) {
+          await new Promise(r => setTimeout(r, 1500));
+          const retried = await fetchVolumes(
+            failedIndexes.map(i => ids[i]),
+          );
+          failedIndexes.forEach((idx, k) => {
+            settled[idx] = retried[k];
+          });
+        }
         const failed = settled.filter(s => !s || !s.ok).length;
         // A volume that fetched "successfully" but contributed ZERO chapters
         // is just as lost as a failed one — count it honestly.
@@ -582,14 +599,16 @@ class NovelArchivePlugin implements Plugin.PluginBase {
     // All attempts failed. Serve the last good list if we have one — the app
     // never deletes library rows, but it also never re-inserts rows a parse
     // stops returning, so silence here is PERMANENT loss on the device.
-    // (A poisoned store entry must NOT be served here — an empty volume beats
-    // a poisoned one, because the next healthy refresh will rebuild it.)
+    // A healthy persisted scan is preferred; an implausibly-shrunken (poisoned)
+    // one is still better than nothing — it beats losing the whole volume, and
+    // the poisoned-entry rescan in probeWithCache repairs it on the next
+    // healthy fetch.
     const memo = volumeChapterCache.get(volumeId);
     const persisted = this.readProbeStore(volumeId);
     const stale =
       memo && memo.length
         ? memo
-        : persisted && !this.storeLooksPoisoned(persisted)
+        : persisted && persisted.chapters.length
           ? persisted.chapters
           : undefined;
     if (stale && stale.length) {
