@@ -135,7 +135,7 @@ class NovelArchivePlugin implements Plugin.PluginBase {
   // nameless source rows (localeCompare crash) were born. Keep in lockstep
   // with the manifest entry build-dist.mjs generates.
   name = 'Novel Archive';
-  version = '1.1.41';
+  version = '1.1.42';
   icon = 'src/en/novelarchive/icon.png';
   site = 'https://novelarchive.cc';
   lang = 'English';
@@ -449,6 +449,24 @@ class NovelArchivePlugin implements Plugin.PluginBase {
     return undefined;
   }
 
+  // A persisted entry whose chapter array shrank implausibly far below its own
+  // signature count (>10%) was written by the 1.1.39/1.1.40 bug: the degraded
+  // edge 404s real chapters on-device, and those poisoned filtered lists got
+  // persisted under the RAW signature — so every later parse sig-HITS and
+  // faithfully serves the poison (Konosuba: 191 of 323, instantly, probe-free).
+  // The site's genuine per-volume absence rate is tiny; treat large shrinkage
+  // as corruption, ignore the entry, rescan, and overwrite it with good data.
+  private static readonly MAX_PLAUSIBLE_DROP_RATIO = 0.1;
+
+  private storeLooksPoisoned(
+    cached: { sig: string; chapters: Plugin.ChapterItem[] },
+  ): boolean {
+    const sigN = this.sigCount(cached.sig);
+    if (sigN <= 0) return false;
+    const dropped = sigN - cached.chapters.length;
+    return dropped > 0 && dropped / sigN > NovelArchivePlugin.MAX_PLAUSIBLE_DROP_RATIO;
+  }
+
   // Availability scan with persistence: when the raw chapter set is unchanged
   // since the last successful scan, reuse it; otherwise scan and persist.
   private async probeWithCache(
@@ -457,22 +475,25 @@ class NovelArchivePlugin implements Plugin.PluginBase {
   ): Promise<Plugin.ChapterItem[]> {
     const sig = this.probeSignature(raw);
     const cached = this.readProbeStore(volumeId);
-    if (cached && cached.sig === sig) {
-      volumeChapterCache.set(volumeId, cached.chapters);
-      return cached.chapters;
+    if (cached && !this.storeLooksPoisoned(cached)) {
+      if (cached.sig === sig) {
+        volumeChapterCache.set(volumeId, cached.chapters);
+        return cached.chapters;
+      }
+      // Degraded-detail guard: under load the API returns 200s with a TRUNCATED
+      // chapter_names list (a shrunken TOC, not an empty one — that empty case
+      // is handled in getVolumeChapters). The site never deletes TOC entries;
+      // genuinely dead chapters still appear in the list and are handled by the
+      // 404 probe. So a raw list SHORTER than the last good scan can only be
+      // degradation, never real data: serve the persisted complete list and keep
+      // the longer store entry. Letting the shrink through is what cut Konosuba
+      // to 191 of 323 chapters on-device while every volume "succeeded".
+      if (this.sigCount(cached.sig) > raw.length) {
+        volumeChapterCache.set(volumeId, cached.chapters);
+        return cached.chapters;
+      }
     }
-    // Degraded-detail guard: under load the API returns 200s with a TRUNCATED
-    // chapter_names list (a shrunken TOC, not an empty one — that empty case
-    // is handled in getVolumeChapters). The site never deletes TOC entries;
-    // genuinely dead chapters still appear in the list and are handled by the
-    // 404 probe. So a raw list SHORTER than the last good scan can only be
-    // degradation, never real data: serve the persisted complete list and keep
-    // the longer store entry. Letting the shrink through is what cut Konosuba
-    // to 191 of 323 chapters on-device while every volume "succeeded".
-    if (cached && this.sigCount(cached.sig) > raw.length) {
-      volumeChapterCache.set(volumeId, cached.chapters);
-      return cached.chapters;
-    }
+    // (Poisoned entries fall through to a full rescan, which overwrites them.)
     // Session-level sig hit: same raw set already scanned this session.
     if (volumeSigMemo.get(volumeId) === sig) {
       const memo = volumeChapterCache.get(volumeId);
@@ -561,8 +582,16 @@ class NovelArchivePlugin implements Plugin.PluginBase {
     // All attempts failed. Serve the last good list if we have one — the app
     // never deletes library rows, but it also never re-inserts rows a parse
     // stops returning, so silence here is PERMANENT loss on the device.
-    const stale = volumeChapterCache.get(volumeId) ??
-      this.readProbeStore(volumeId)?.chapters;
+    // (A poisoned store entry must NOT be served here — an empty volume beats
+    // a poisoned one, because the next healthy refresh will rebuild it.)
+    const memo = volumeChapterCache.get(volumeId);
+    const persisted = this.readProbeStore(volumeId);
+    const stale =
+      memo && memo.length
+        ? memo
+        : persisted && !this.storeLooksPoisoned(persisted)
+          ? persisted.chapters
+          : undefined;
     if (stale && stale.length) {
       staleVolumes.add(volumeId);
       return stale;
@@ -611,7 +640,7 @@ class NovelArchivePlugin implements Plugin.PluginBase {
   }
 
   // Eager mode: probe every chapter in parallel (bounded by
-  // SKIP_CONCURRENCY), drop the ones that 404 / have no content, and renumber
+  // SKIP_CONCURRENCY), drop the ones CONFIRMED absent, and renumber
   // the survivors 1..N. Runs once; the app caches the resulting list. A probe
   // failure means "keep" -- we don't drop a chapter we couldn't verify.
   private async filterUnavailableChapters(
@@ -622,15 +651,48 @@ class NovelArchivePlugin implements Plugin.PluginBase {
       const [novelId, num] = ch.path.split('/');
       const available = await this.probeChapterAvailable(novelId, Number(num));
       // Unverifiable (network error) -> keep, don't drop.
-      return available ? ch : null;
+      return available ? ch : { ch, dropped: true as const };
     });
     const settled = await this.runWithConcurrency(
       tasks,
       NovelArchivePlugin.SKIP_CONCURRENCY,
     );
-    const kept = settled.filter(
-      (c): c is Plugin.ChapterItem => c !== null,
-    );
+    // Second look before any drop: the degraded edge answers REAL chapters
+    // with the same 404 body it uses for genuine absences. A real absence
+    // stays 404 on re-probe; a degraded one flips to 200. Without this the
+    // device wiped ~7 chapters per volume into the persisted cache.
+    const firstPassDropped = settled
+      .filter(
+        (s): s is { ch: Plugin.ChapterItem; dropped: true } =>
+          s !== null && 'dropped' in s,
+      )
+      .map(s => s.ch);
+    const reprobeTasks = firstPassDropped.map(async ch => {
+      const [novelId, num] = ch.path.split('/');
+      const stillGone = !(await this.probeChapterAvailable(
+        novelId,
+        Number(num),
+      ));
+      return stillGone ? ch : null; // recovered on re-probe -> keep
+    });
+    const confirmedDropped = (
+      await this.runWithConcurrency(reprobeTasks, 2)
+    ).filter((c): c is Plugin.ChapterItem => c !== null);
+    // Mass-drop circuit breaker: if this scan "dropped" more than 10% of the
+    // volume, the verdicts are degradation, not data (the site's real absence
+    // rate per volume is tiny). Trust nothing from this scan: keep the whole
+    // raw list. Genuine dead chapters simply fail at read time, where the
+    // reader skips them — visible-with-warts beats silently missing volumes.
+    if (
+      confirmedDropped.length > 0 &&
+      confirmedDropped.length / chapters.length >
+        NovelArchivePlugin.MAX_PLAUSIBLE_DROP_RATIO
+    ) {
+      return chapters;
+    }
+    const confirmedPaths = new Set(confirmedDropped.map(c => c.path));
+    // Preserve original order while removing only confirmed absences.
+    const kept = chapters.filter(ch => !confirmedPaths.has(ch.path));
     return kept.map((ch, n) => {
       const newNum = n + 1;
       // Update display name to match new sequential number
@@ -776,6 +838,7 @@ class NovelArchivePlugin implements Plugin.PluginBase {
     const promise = new Promise<T[]>(res => {
       resolve = res;
     });
+    if (tasks.length === 0) return [];
     const results: T[] = new Array(tasks.length);
     let active = 0;
     let cursor = 0;
