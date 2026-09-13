@@ -135,7 +135,7 @@ class NovelArchivePlugin implements Plugin.PluginBase {
   // nameless source rows (localeCompare crash) were born. Keep in lockstep
   // with the manifest entry build-dist.mjs generates.
   name = 'Novel Archive';
-  version = '1.1.43';
+  version = '1.1.44';
   icon = 'src/en/novelarchive/icon.png';
   site = 'https://novelarchive.cc';
   lang = 'English';
@@ -403,6 +403,26 @@ class NovelArchivePlugin implements Plugin.PluginBase {
             const name = vol ? `Volume ${vol} Chapter ${seq}` : ch.name;
             merged.push({ ...ch, chapterNumber: seq, name });
           }
+        }
+        try {
+          storage.set('nadbg', {
+            ts: new Date().toISOString(),
+            idCount: ids.length,
+            settledLen: settled.length,
+            holes: Array.from({ length: ids.length }, (_v, i) =>
+              i in settled ? '0' : '1',
+            ).join(''),
+            perVol: settled
+              .map((s, i) => `${i}:${s && s.ok ? s.chapters.length : -1}`)
+              .join(','),
+            idsShort: ids.map(x => String(x).slice(-5)).join(','),
+            merged: merged.length,
+            lost,
+            contributed,
+            volCount,
+          });
+        } catch {
+          /* debug only */
         }
         if (merged.length) {
           novel.chapters = merged;
