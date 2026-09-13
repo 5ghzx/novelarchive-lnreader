@@ -21,7 +21,7 @@ class LnoriComPlugin implements Plugin.PluginBase {
   // Required by the app's PluginItem: the UPDATE path copies name/site/lang
   // from this evaluated module back into the stored plugin row.
   lang = 'English';
-  version = '1.0.22';
+  version = '1.0.23';
   pluginSettings = {
     mergeCoverTitle: {
       label: 'Merge cover + title page into one entry',
@@ -88,6 +88,14 @@ class LnoriComPlugin implements Plugin.PluginBase {
   // real Chrome and immune to that fingerprint rule. The direct path stays
   // primary (fastest, no third party) whenever the site answers it.
   private static readonly RELAY_PREFIX = 'https://r.jina.ai/';
+  // Honest client identity on BOTH legs. The app injects a Chrome UA by
+  // default; relay services (r.jina.ai) bot-screen exactly that pattern and
+  // 403 it (verified: same headers, honest UA -> 200, Chrome UA -> 403), and
+  // a browser-claiming UA over the app's non-browser TLS is the mismatch
+  // pattern lnori.com's zone punishes. An honest UA fixes the relay leg and
+  // gives the direct leg its best shot; relays/caches remain the safety net.
+  private static readonly PLUGIN_UA =
+    'LNReader/2.1.0 (plugin: lnori-com; +https://github.com/5ghzx/novelarchive-lnreader)';
   // Free-tier relay budget is 20 requests / 60s (x-ratelimit headers). Stay
   // under it ourselves so a first full-series parse (N volume pages) can't
   // trip 429s — self-throttle to 18/min.
@@ -119,16 +127,21 @@ class LnoriComPlugin implements Plugin.PluginBase {
     // fetchApi applies the app's default headers; nothing about the device
     // leaks beyond what a normal page view would send.
     await this.throttleRelay();
-    const res = await fetchApi(LnoriComPlugin.RELAY_PREFIX + url, {
-      headers: { 'x-return-format': 'html' },
-    });
+    const relayInit = {
+      headers: {
+        'x-return-format': 'html',
+        'User-Agent': LnoriComPlugin.PLUGIN_UA,
+      },
+    };
+    const res = await fetchApi(LnoriComPlugin.RELAY_PREFIX + url, relayInit);
     if (res.status === 429) {
       // Shared free tier can still 429 under us — one polite retry after a
       // short wait instead of failing the page.
       await new Promise(r => setTimeout(r, 15000));
-      const retry = await fetchApi(LnoriComPlugin.RELAY_PREFIX + url, {
-        headers: { 'x-return-format': 'html' },
-      });
+      const retry = await fetchApi(
+        LnoriComPlugin.RELAY_PREFIX + url,
+        relayInit,
+      );
       if (!retry.ok) throw new Error(`relay HTTP ${retry.status}`);
       return retry.text();
     }
@@ -174,7 +187,11 @@ class LnoriComPlugin implements Plugin.PluginBase {
     if (Date.now() >= LnoriComPlugin.directDownUntil) {
       try {
         const body = await LnoriComPlugin.withTimeout(
-          Promise.resolve(fetchText(url)),
+          Promise.resolve(
+            fetchText(url, {
+              headers: { 'User-Agent': LnoriComPlugin.PLUGIN_UA },
+            }),
+          ),
           45000,
           `Direct fetch of ${url}`,
         );
