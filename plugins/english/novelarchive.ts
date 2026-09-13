@@ -135,7 +135,7 @@ class NovelArchivePlugin implements Plugin.PluginBase {
   // nameless source rows (localeCompare crash) were born. Keep in lockstep
   // with the manifest entry build-dist.mjs generates.
   name = 'Novel Archive';
-  version = '1.1.38';
+  version = '1.1.39';
   icon = 'src/en/novelarchive/icon.png';
   site = 'https://novelarchive.cc';
   lang = 'English';
@@ -561,7 +561,13 @@ class NovelArchivePlugin implements Plugin.PluginBase {
         `${this.site}/api/novels/${encodeURIComponent(
           novelId,
         )}/chapters/${encodeURIComponent(String(chapterNumber))}`,
-        { headers: { Accept: 'application/json' } },
+        {
+          headers: {
+            Accept: 'application/json',
+            'User-Agent':
+              'LNReader/2.1.0 (plugin: novelarchive; +https://github.com/5ghzx/novelarchive-lnreader)',
+          },
+        },
       );
       // Drop ONLY on a confirmed 404/410 (chapter genuinely absent — the API
       // answers real "Chapter does not exist" cases with exactly this). Any
@@ -887,6 +893,13 @@ class NovelArchivePlugin implements Plugin.PluginBase {
       headers: {
         Accept: 'application/json',
         Referer: this.site,
+        // Honest client identity. The app injects a WebView Chrome UA by
+        // default; a browser-claiming UA over the app's non-browser TLS stack
+        // is exactly the fingerprint mismatch that got lnori.com's zone (and
+        // r.jina.ai) to mistreat the app's requests, and is the prime
+        // suspect for NA's edge degrading bursts on-device only.
+        'User-Agent':
+          'LNReader/2.1.0 (plugin: novelarchive; +https://github.com/5ghzx/novelarchive-lnreader)',
       },
     });
 
