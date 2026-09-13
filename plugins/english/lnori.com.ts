@@ -1,4 +1,4 @@
-import { fetchText } from '@libs/fetch';
+import { fetchText, fetchApi } from '@libs/fetch';
 import { storage } from '@libs/storage';
 import { Plugin } from '@/types/plugin';
 import { Filters, FilterTypes } from '@libs/filterInputs';
@@ -21,24 +21,30 @@ class LnoriComPlugin implements Plugin.PluginBase {
   // Required by the app's PluginItem: the UPDATE path copies name/site/lang
   // from this evaluated module back into the stored plugin row.
   lang = 'English';
-  version = '1.0.21';
+  version = '1.0.22';
   pluginSettings = {
     mergeCoverTitle: {
       label: 'Merge cover + title page into one entry',
       type: 'Switch',
       value: true,
     },
+    relayFallback: {
+      label: 'Fallback fetch via browser-render relay (fixes timeouts)',
+      type: 'Switch',
+      value: true,
+    },
   };
-  // Network layer deliberately mirrors the official LNReader lnori plugin
-  // (LNReader/lnreader-plugins, master, plugins/english/lnori.ts): one bare
-  // fetchText() per page, app-default headers, NO retries, NO multi-request
-  // bursts. Retry storms and parallel bursts are what push lnori.com's rate
-  // score into its tarpit penalty box — the reported "works right after
-  // install, then times out forever" pattern. Instead of retrying we AVOID
-  // REQUESTS: every page is cached persistently (MMKV via the app's plugin
-  // storage — survives app restarts, which is where the old module-level
-  // cache died and re-downloaded the 1.8 MB library every session) and
-  // served stale whenever the site misbehaves.
+  // Network layer: one patient fetch per page, app-default headers, NO
+  // retries against the site itself, NO multi-request bursts — retry storms
+  // and parallel bursts are what push lnori.com's rate score into its tarpit
+  // penalty box (the reported "works right after install, then times out
+  // forever" pattern). Direct fetch first; when the site tarpits or shells
+  // the request, ONE transparent fallback through a browser-render relay
+  // (see fetchViaRelay). Beyond that we AVOID REQUESTS: every page is cached
+  // persistently (MMKV via the app's plugin storage — survives app restarts,
+  // which is where the old module-level cache died and re-downloaded the
+  // 1.8 MB library every session) and served stale whenever the site
+  // misbehaves.
   private static readonly FETCH_TIMEOUT_MS = 60000;
   private static readonly LIBRARY_TTL_MS = 7 * 24 * 3600 * 1000;
   private static readonly SERIES_TTL_MS = 12 * 3600 * 1000;
@@ -67,38 +73,152 @@ class LnoriComPlugin implements Plugin.PluginBase {
     }
   }
 
-  private async fetchPage(url: string): Promise<string> {
-    // Hard 60s ceiling (fork feature: an e-ink spinner must never hang
-    // forever) around a SINGLE patient request — no retries. A timeout or
-    // garbage page falls through to stale-cache fallbacks at the call sites
-    // instead of hammering the site with automatic re-requests.
-    const body = await new Promise<string>((resolve, reject) => {
-      const timer = setTimeout(
-        () => reject(new Error(`LNORI.com timed out after 60s: ${url}`)),
-        LnoriComPlugin.FETCH_TIMEOUT_MS,
-      );
-      fetchText(url)
-        .then(b => {
-          clearTimeout(timer);
-          resolve(b);
-        })
-        .catch(e => {
-          clearTimeout(timer);
-          reject(e instanceof Error ? e : new Error(String(e)));
-        });
+  // Every real lnori page carries at least one of these markers (library →
+  // data-t= on cards, series → hero-card/s-title, volume → toc-view, chapter
+  // → section class="chapter"). A response lacking ALL of them is a bot-check
+  // shell, a soft-404, or a truncated body — never a usable page.
+  private static readonly PAGE_MARKERS =
+    /class="s-title"|class="hero-card"|toc-view|section class="chapter"|data-t=/;
+  // Browser-render relay (r.jina.ai, free tier): renders the target page in a
+  // real headless Chrome and returns the resulting HTML. lnori.com's zone
+  // silently tarpits the APP's requests (verified byte-for-byte through a USB
+  // tunnel: TLS handshake + request go out, zero response bytes come back)
+  // while browsers on the same network pass — so when the direct fetch fails
+  // or returns a shell, we re-fetch through the relay, whose requests are
+  // real Chrome and immune to that fingerprint rule. The direct path stays
+  // primary (fastest, no third party) whenever the site answers it.
+  private static readonly RELAY_PREFIX = 'https://r.jina.ai/';
+  // Free-tier relay budget is 20 requests / 60s (x-ratelimit headers). Stay
+  // under it ourselves so a first full-series parse (N volume pages) can't
+  // trip 429s — self-throttle to 18/min.
+  private static readonly RELAY_MAX_PER_MIN = 18;
+  // Once a direct fetch exhibits the tarpit signature (timeout or bot-check
+  // shell), skip the direct path entirely for a while: otherwise every page
+  // of a multi-volume parse would burn its full direct window before
+  // falling back (~45s x N volumes). Ten minutes, refreshed on each new
+  // tarpit hit; a direct success clears it.
+  private static DIRECT_DOWN_MS = 10 * 60000;
+  private static directDownUntil = 0;
+  private static relayLog: number[] = [];
+
+  // Wait until the relay's 60s window has budget for one more request.
+  private async throttleRelay(): Promise<void> {
+    const now = Date.now();
+    LnoriComPlugin.relayLog = LnoriComPlugin.relayLog.filter(
+      t => now - t < 60000,
+    );
+    if (LnoriComPlugin.relayLog.length >= LnoriComPlugin.RELAY_MAX_PER_MIN) {
+      const wait = 60000 - (now - LnoriComPlugin.relayLog[0]) + 500;
+      if (wait > 0) await new Promise(r => setTimeout(r, wait));
+    }
+    LnoriComPlugin.relayLog.push(Date.now());
+  }
+
+  private async fetchViaRelay(url: string): Promise<string> {
+    // x-return-format: html — without it the relay returns markdown text.
+    // fetchApi applies the app's default headers; nothing about the device
+    // leaks beyond what a normal page view would send.
+    await this.throttleRelay();
+    const res = await fetchApi(LnoriComPlugin.RELAY_PREFIX + url, {
+      headers: { 'x-return-format': 'html' },
     });
-    if (
-      body.length < 3000 &&
-      !/class="s-title"|class="hero-card"|article\.card|toc-view|section class="chapter"/.test(
-        body,
-      )
-    ) {
+    if (res.status === 429) {
+      // Shared free tier can still 429 under us — one polite retry after a
+      // short wait instead of failing the page.
+      await new Promise(r => setTimeout(r, 15000));
+      const retry = await fetchApi(LnoriComPlugin.RELAY_PREFIX + url, {
+        headers: { 'x-return-format': 'html' },
+      });
+      if (!retry.ok) throw new Error(`relay HTTP ${retry.status}`);
+      return retry.text();
+    }
+    if (!res.ok) {
+      throw new Error(`relay HTTP ${res.status}`);
+    }
+    return res.text();
+  }
+
+  private describe(e: unknown): string {
+    const msg = e instanceof Error ? e.message : String(e);
+    return msg.length > 160 ? msg.slice(0, 160) + '…' : msg;
+  }
+
+  private static withTimeout<T>(
+    p: Promise<T>,
+    ms: number,
+    what: string,
+  ): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      const t = setTimeout(() => reject(new Error(`${what} timed out`)), ms);
+      p.then(
+        v => {
+          clearTimeout(t);
+          resolve(v);
+        },
+        e => {
+          clearTimeout(t);
+          reject(e instanceof Error ? e : new Error(String(e)));
+        },
+      );
+    });
+  }
+
+  private async fetchPage(url: string): Promise<string> {
+    // Direct leg first (45s cap): fastest and no third party when the site
+    // answers. On any failure — timeout, empty shell, bot-check — fall back
+    // to the browser-render relay, which sidesteps the site's fingerprint
+    // tarpit entirely. No automatic retries against lnori.com itself: retry
+    // storms are what earn the tarpit in the first place. Call sites serve
+    // stale cache when this ultimately throws.
+    let directError: unknown;
+    if (Date.now() >= LnoriComPlugin.directDownUntil) {
+      try {
+        const body = await LnoriComPlugin.withTimeout(
+          Promise.resolve(fetchText(url)),
+          45000,
+          `Direct fetch of ${url}`,
+        );
+        if (LnoriComPlugin.PAGE_MARKERS.test(body)) {
+          LnoriComPlugin.directDownUntil = 0; // direct is healthy again
+          return body;
+        }
+        directError = new Error(
+          `site returned an unusable page (bot-check shell)`,
+        );
+        // Shell = the bot rule, not a one-off. Stop feeding it requests.
+        LnoriComPlugin.directDownUntil =
+          Date.now() + LnoriComPlugin.DIRECT_DOWN_MS;
+      } catch (e) {
+        directError = e;
+        if (/timed out/i.test(e instanceof Error ? e.message : String(e))) {
+          LnoriComPlugin.directDownUntil =
+            Date.now() + LnoriComPlugin.DIRECT_DOWN_MS;
+        }
+      }
+    } else {
+      directError = new Error('direct skipped (tarpit breaker active)');
+    }
+    const direct = this.describe(directError);
+    if (storage.get('relayFallback') === false) {
+      throw new Error(`LNORI.com direct fetch failed (${direct}): ${url}`);
+    }
+    // Relay leg gets its own generous budget: it may have to wait out the
+    // 20/min throttle before even sending (worst ~60s) plus render time.
+    const budget = 105000;
+    try {
+      const relayBody = await LnoriComPlugin.withTimeout(
+        this.fetchViaRelay(url),
+        budget,
+        `Relay fetch of ${url}`,
+      );
+      if (LnoriComPlugin.PAGE_MARKERS.test(relayBody)) return relayBody;
+      throw new Error('relay returned an unusable page');
+    } catch (relayError) {
       throw new Error(
-        `LNORI.com returned an empty or challenge page for ${url}. ` +
-          `Open it once in the app's webview (or a browser), then refresh here.`,
+        `LNORI.com: direct fetch failed (${direct}) and browser-render relay ` +
+          `also failed (${this.describe(relayError)}) for ${url}`,
       );
     }
-    return body;
   }
 
   // Library cache: in-memory memo over a PERSISTENT MMKV copy, so app
