@@ -135,7 +135,7 @@ class NovelArchivePlugin implements Plugin.PluginBase {
   // nameless source rows (localeCompare crash) were born. Keep in lockstep
   // with the manifest entry build-dist.mjs generates.
   name = 'Novel Archive';
-  version = '1.1.45';
+  version = '1.1.46';
   icon = 'src/en/novelarchive/icon.png';
   site = 'https://novelarchive.cc';
   lang = 'English';
@@ -404,26 +404,6 @@ class NovelArchivePlugin implements Plugin.PluginBase {
             merged.push({ ...ch, chapterNumber: seq, name });
           }
         }
-        try {
-          storage.set('nadbg', {
-            ts: new Date().toISOString(),
-            idCount: ids.length,
-            settledLen: settled.length,
-            holes: Array.from({ length: ids.length }, (_v, i) =>
-              i in settled ? '0' : '1',
-            ).join(''),
-            perVol: settled
-              .map((s, i) => `${i}:${s && s.ok ? s.chapters.length : -1}`)
-              .join(','),
-            idsShort: ids.map(x => String(x).slice(-5)).join(','),
-            merged: merged.length,
-            lost,
-            contributed,
-            volCount,
-          });
-        } catch {
-          /* debug only */
-        }
         if (merged.length) {
           novel.chapters = merged;
           let banner = `[${contributed}/${volCount} volumes — ${merged.length} chapters]`;
@@ -686,6 +666,7 @@ class NovelArchivePlugin implements Plugin.PluginBase {
     chapters: Plugin.ChapterItem[],
   ): Promise<Plugin.ChapterItem[]> {
     if (!chapters.length) return chapters;
+    // Only drop when both the scan AND a re-probe agree the chapter is gone.
     const tasks = chapters.map(async ch => {
       const [novelId, num] = ch.path.split('/');
       const available = await this.probeChapterAvailable(novelId, Number(num));
