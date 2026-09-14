@@ -123,6 +123,12 @@ const volumeChapterCache = new Map<string, Plugin.ChapterItem[]>();
 // the base volume is probed in STEP 1 and would otherwise be scanned AGAIN
 // when the merge loop reaches it (10 wasted probes per novel).
 const volumeSigMemo = new Map<string, string>();
+// Per-session cache of fully-read volume HTML (mega reads). Re-opening a
+// 300-chapter volume re-fires ~300 paced requests (~80s) — within a single
+// session there is no reason to pay that twice. COMPLETE reads only: a
+// partial read must stay re-fetchable. Empty string = known-oversize.
+const volumeHtmlCache = new Map<string, string>();
+const VOLUME_HTML_CACHE_MAX_BYTES = 3_000_000;
 // Volume ids kept alive by their cached copy during the CURRENT parse
 // (cleared at the start of each merge) — powers the "served from cache"
 // banner note.
@@ -223,7 +229,7 @@ class NovelArchivePlugin implements Plugin.PluginBase {
   // nameless source rows (localeCompare crash) were born. Keep in lockstep
   // with the manifest entry build-dist.mjs generates.
   name = 'Novel Archive';
-  version = '1.1.48';
+  version = '1.1.49';
   icon = 'src/en/novelarchive/icon.png';
   site = 'https://novelarchive.cc';
   lang = 'English';
@@ -902,6 +908,10 @@ class NovelArchivePlugin implements Plugin.PluginBase {
         `/chapters/${encodeURIComponent(String(num))}`
       );
     };
+    // Session cache: a complete read of this volume already happened this
+    // session — serve it instead of re-firing ~300 paced requests (~80s).
+    const cached = volumeHtmlCache.get(volumeId);
+    if (cached) return cached;
     const fetchOne = async (
       ch: Plugin.ChapterItem,
       deadline: number,
@@ -929,14 +939,20 @@ class NovelArchivePlugin implements Plugin.PluginBase {
     // gets a slice, the rescue pass whatever remains. Without this, a device
     // the site is refusing outright would sit through every Retry-After of
     // every chapter (~58s measured) and trip the reader's own timeout.
+    //
+    // The runner gets the SAME deadline: with lazy task factories, workers
+    // refuse to start chapters past it, so total time is actually bounded
+    // (an eager promise list would pre-book pacer slots for the whole queue
+    // and run 145s "within" a 40s budget — measured live).
     const deadline = Date.now() + VOLUME_READ_BUDGET_MS;
     const firstPassDeadline = Math.min(
       deadline,
       Date.now() + VOLUME_FIRST_PASS_MS,
     );
     const outcomes = await this.runWithConcurrency(
-      chapters.map(ch => fetchOne(ch, firstPassDeadline)),
+      chapters.map(ch => () => fetchOne(ch, firstPassDeadline)),
       6,
+      firstPassDeadline,
     );
 
     // Rescue pass: only the chapters that FAILED for a reason other than
@@ -949,8 +965,9 @@ class NovelArchivePlugin implements Plugin.PluginBase {
       .filter(i => i >= 0);
     if (retryIndexes.length && Date.now() < deadline) {
       const retried = await this.runWithConcurrency(
-        retryIndexes.map(i => fetchOne(chapters[i], deadline)),
+        retryIndexes.map(i => () => fetchOne(chapters[i], deadline)),
         3,
+        deadline,
       );
       retryIndexes.forEach((chapterIndex, slot) => {
         const outcome = retried[slot];
@@ -964,6 +981,17 @@ class NovelArchivePlugin implements Plugin.PluginBase {
       .join('\n<hr/>\n');
     if (html) {
       // Partial (a chapter genuinely 404'd) is far better than an error page.
+      // Cache when COMPLETE — every slot resolved to content or a CONFIRMED
+      // absence. Absent chapters are permanently absent (verified 404), so a
+      // read with absents is still final and re-opening it must not re-fire
+      // the whole paced crawl. Only "failed" slots (throttled/degraded) keep
+      // a volume uncached so a re-open retries them.
+      if (outcomes.every(o => o && (o.html || o.absent))) {
+        volumeHtmlCache.set(
+          volumeId,
+          html.length <= VOLUME_HTML_CACHE_MAX_BYTES ? html : '',
+        );
+      }
       return html;
     }
     const absent = outcomes.filter(o => o && o.absent).length;
@@ -1027,9 +1055,19 @@ class NovelArchivePlugin implements Plugin.PluginBase {
   // are skipped by Array.prototype.filter/map — so a whole volume vanished
   // while `lost` stayed 0 and the banner happily reported 17/17. Missing vs
   // failed matters here: callers rely on `!result` to count and retry losses.
+  //
+  // Tasks are LAZY FACTORIES (or promises — both accepted). This matters: a
+  // plain promise created up front starts executing immediately, and since
+  // every task begins with `gate.acquire()`, a 300-chapter volume enqueued
+  // 300 gate slots at CREATION time — the "deadline" could no longer bound
+  // anything (measured: a 40s-budget read ran 145s because the queue was
+  // pre-booked for 78s of pacer slots before the first fetch even fired).
+  // With factories, a task reserves its slot only when a worker STARTS it, so
+  // workers can also refuse to begin work past a deadline.
   private async runWithConcurrency<T>(
-    tasks: Promise<T>[],
+    tasks: (Promise<T> | (() => Promise<T>))[],
     limit: number,
+    deadline = Number.POSITIVE_INFINITY,
   ): Promise<T[]> {
     const results: (T | undefined)[] = new Array(tasks.length).fill(
       undefined,
@@ -1039,8 +1077,16 @@ class NovelArchivePlugin implements Plugin.PluginBase {
       for (;;) {
         const i = cursor++;
         if (i >= tasks.length) return;
+        // Don't START new work past the deadline. Tasks already running are
+        // left to finish (their own deadline bounds them); unstarted slots
+        // stay `undefined`, which callers already count as "failed".
+        if (Date.now() >= deadline) return;
+        const task = tasks[i];
         try {
-          results[i] = await tasks[i];
+          results[i] =
+            typeof task === 'function'
+              ? await (task as () => Promise<T>)()
+              : await task;
         } catch {
           results[i] = undefined;
         }
