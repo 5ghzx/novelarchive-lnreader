@@ -93,8 +93,10 @@ type ChapterResponse = {
   };
 };
 
-// Discovered volume during merge: id + title (for volume-number sorting).
-type DiscoveredVolume = { id: string; title: string };
+// Discovered volume during merge: id + title (for volume-number sorting)
+// + the volume's own cover path (so the merged series can present Vol 1's
+// artwork instead of whichever sibling the reader happened to open).
+type DiscoveredVolume = { id: string; title: string; image?: string };
 
 // Matches "Chapter 1" / "chapter  3" at the start of a chapter name.
 // Hoisted so it isn't recompiled for every chapter in every volume.
@@ -108,6 +110,11 @@ const CHAPTER_NAME_RE = /^chapter\s*(\d+)/i;
 // pair of searches per series — caching skips them on every open/refresh).
 const searchSeen = new Set<string>();
 const seriesVolumes = new Map<string, string[]>();
+// seriesKey -> cover image path of the series' lowest volume, captured when
+// volume discovery runs (search results carry each volume's cover). Lets the
+// merged series present Vol 1's artwork regardless of which sibling id the
+// parse was opened from — including when ids come from the session cache.
+const seriesCoverImage = new Map<string, string>();
 
 // Session-level memo of each volume's last GOOD (empty-dropped, renumbered)
 // chapter list. MMKV (storage) is the durable layer; this Map is the fast
@@ -229,7 +236,7 @@ class NovelArchivePlugin implements Plugin.PluginBase {
   // nameless source rows (localeCompare crash) were born. Keep in lockstep
   // with the manifest entry build-dist.mjs generates.
   name = 'Novel Archive';
-  version = '1.1.49';
+  version = '1.1.50';
   icon = 'src/en/novelarchive/icon.png';
   site = 'https://novelarchive.cc';
   lang = 'English';
@@ -413,6 +420,8 @@ class NovelArchivePlugin implements Plugin.PluginBase {
                   (r.novels || []).map<DiscoveredVolume>(n => ({
                     id: String(n.id),
                     title: n.title,
+                    image:
+                      n.cover_url || n.novel_image || n.image_url || undefined,
                   })),
                 )
                 .catch(() => [] as DiscoveredVolume[]),
@@ -436,6 +445,8 @@ class NovelArchivePlugin implements Plugin.PluginBase {
           ids = collected.map(n => n.id).slice(0, 30);
           volCount = ids.length;
           seriesVolumes.set(key, ids);
+          const seriesCover = collected.find(n => !!n.image)?.image;
+          if (seriesCover) seriesCoverImage.set(key, seriesCover);
         } else {
           volCount = ids.length;
         }
@@ -503,6 +514,18 @@ class NovelArchivePlugin implements Plugin.PluginBase {
           }
         }
         if (merged.length) {
+          // Present the merged SERIES, not the entry volume the reader opened:
+          // this parse may have been triggered from any sibling id (e.g. a
+          // library row created as "..., Vol. 3"), and the app rewrites the
+          // stored row's name/cover from every parse — so the volume's own
+          // title/artwork previously stuck to the card forever even though
+          // the chapter list now spans all volumes.
+          novel.name =
+            this.cleanText(this.baseTitle(source.title)) || novel.name;
+          const seriesImage = seriesCoverImage.get(key);
+          if (seriesImage) {
+            novel.cover = this.absoluteUrl(seriesImage);
+          }
           novel.chapters = merged;
           let banner = `[${contributed}/${volCount} volumes — ${merged.length} chapters]`;
           if (lost > 0) {
