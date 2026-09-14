@@ -128,6 +128,94 @@ const volumeSigMemo = new Map<string, string>();
 // banner note.
 const staleVolumes = new Set<string>();
 
+// ---------------------------------------------------------------------------
+// Request pacing.
+//
+// The API sits behind Cloudflare rate limiting: once a burst of roughly 40
+// requests lands in a few seconds the edge answers EVERYTHING with
+// `HTTP 429` + `retry-after: 10` until that window drains. The old code
+// treated 429 as a generic error, retried once after 400ms, then dropped the
+// chapter — so opening a volume right after another one dropped every
+// chapter in it and reported "no readable content" (the Volume 2 field
+// report). Measured on the live API: concurrency 8 trips it, sequential
+// ~2 rps does not, and a saturated IP recovers in ~12s.
+//
+// So: one GLOBAL gate in front of every request. It enforces a minimum gap
+// between request starts (additively tightened on success, multiplicatively
+// widened on pushback) and, when the server says 429, pauses ALL callers for
+// its own Retry-After instead of letting each one fail on its own timer.
+// Reads then stay just under the limiter instead of tripping it and dying.
+const GATE_MIN_GAP_MS = 260; // steady state: ~3.8 requests/second
+const GATE_MAX_GAP_MS = 2000; // worst case: one request every 2s
+// On success the gap decays MULTIPLICATIVELY back toward the floor, so a
+// single good response ends the crawl instead of it outliving the reader's
+// patience (an additive -20ms would take ~190 successes to undo a storm).
+const GATE_RECOVERY_FACTOR = 0.75;
+const GATE_DEFAULT_RETRY_AFTER_MS = 10000; // observed Cloudflare window
+const RATE_LIMIT_STATUSES = new Set([429, 503]);
+// Patience for one volume read. The reader is blocked on this request and the
+// app gives up on it eventually, so a partial volume served inside the budget
+// beats a timeout: pass 1 gets its own slice, the rescue pass whatever is left.
+const VOLUME_FIRST_PASS_MS = 20000;
+const VOLUME_READ_BUDGET_MS = 40000;
+
+// Response shape we rely on; react-native's fetch Response satisfies it, and
+// every field is optional so a wrapper without `headers` can't crash us.
+type PacedResponse = {
+  status?: number;
+  ok?: boolean;
+  headers?: { get?: (name: string) => string | null };
+  json: () => Promise<unknown>;
+};
+
+// Three-way verdict: a response we can use, a CONFIRMED absence (404/410 —
+// the site's own "Chapter does not exist"), or "unverifiable" (throttled /
+// transport failure). Only a confirmed absence may ever drop a chapter.
+type PacedResult =
+  | { kind: 'ok'; response: PacedResponse }
+  | { kind: 'absent' }
+  | { kind: 'unavailable' };
+
+class RequestGate {
+  private nextSlot = 0;
+  private pausedUntil = 0;
+  private gapMs = GATE_MIN_GAP_MS;
+
+  async acquire(): Promise<void> {
+    const now = Date.now();
+    // max() of "when the next slot is free" and "when the rate-limit pause
+    // ends" — paused callers all dock at the same deadline, they don't queue
+    // up one Retry-After each.
+    const start = Math.max(now, this.nextSlot, this.pausedUntil);
+    this.nextSlot = start + this.gapMs;
+    const wait = start - now;
+    if (wait > 0) {
+      await new Promise(resolve => setTimeout(resolve, wait));
+    }
+  }
+
+  // Server pushback: hold every request until the Retry-After deadline and
+  // halve the steady-state rate (bounded) so the next burst is gentler.
+  penalize(waitMs: number): void {
+    const until = Date.now() + Math.max(0, waitMs);
+    this.pausedUntil = Math.max(this.pausedUntil, until);
+    this.nextSlot = Math.max(this.nextSlot, this.pausedUntil);
+    this.gapMs = Math.min(GATE_MAX_GAP_MS, Math.round(this.gapMs * 2));
+  }
+
+  // Healthy response: back off the throttle toward full speed.
+  reward(): void {
+    if (this.gapMs > GATE_MIN_GAP_MS) {
+      this.gapMs = Math.max(
+        GATE_MIN_GAP_MS,
+        Math.round(this.gapMs * GATE_RECOVERY_FACTOR),
+      );
+    }
+  }
+}
+
+const requestGate = new RequestGate();
+
 class NovelArchivePlugin implements Plugin.PluginBase {
   id = 'novelarchive';
   // REQUIRED by the app's update path: it overwrites the stored row's
@@ -135,7 +223,7 @@ class NovelArchivePlugin implements Plugin.PluginBase {
   // nameless source rows (localeCompare crash) were born. Keep in lockstep
   // with the manifest entry build-dist.mjs generates.
   name = 'Novel Archive';
-  version = '1.1.46';
+  version = '1.1.48';
   icon = 'src/en/novelarchive/icon.png';
   site = 'https://novelarchive.cc';
   lang = 'English';
@@ -290,7 +378,11 @@ class NovelArchivePlugin implements Plugin.PluginBase {
     // Always on — a 404 chapter is unusable, so it never belongs in the list.
     // (Skipped entirely when this volume's chapter set is unchanged since its
     // last successful scan — see probeWithCache.)
-    novel.chapters = await this.probeWithCache(id, novel.chapters);
+    // In mega mode the base list is replaced by one row per volume below, so
+    // probing it is a wasted ~20-request burst on top of the volume sweeps.
+    novel.chapters = this.megaMode()
+      ? novel.chapters
+      : await this.probeWithCache(id, novel.chapters);
 
     // STEP 2: Merge sibling volumes into one series (if enabled).
     if (storage.get('mergeSeries')) {
@@ -440,6 +532,9 @@ class NovelArchivePlugin implements Plugin.PluginBase {
   // result, so it is SKIPPED and the persisted scan is reused. Removes ~19
   // probes per volume from every refresh (Konosuba: ~300 requests -> ~17),
   // which is what kept tripping the site's rate limiter and wiping volumes.
+  // Signature of the RAW chapter set (never of the probed result): it only
+  // says "which chapters does this volume list", so it stays valid whichever
+  // mode wrote the entry.
   private probeSignature(chapters: Plugin.ChapterItem[]): string {
     return `${chapters.length}:${chapters.map(c => c.name).join('|')}`;
   }
@@ -450,12 +545,18 @@ class NovelArchivePlugin implements Plugin.PluginBase {
     return Number.isFinite(n) ? n : 0;
   }
 
+  // `probed` marks entries produced by an actual availability scan. In mega
+  // mode the scan is skipped on purpose, so the entry holds the RAW list and
+  // says `probed: false` — the read path may use it as a fallback, but the
+  // scan path must not mistake it for verified data.
   private readProbeStore(
     volumeId: string,
-  ): { sig: string; chapters: Plugin.ChapterItem[] } | undefined {
+  ):
+    | { sig: string; chapters: Plugin.ChapterItem[]; probed?: boolean }
+    | undefined {
     try {
       const cached = storage.get(`naprobe:${volumeId}`) as
-        | { sig: string; chapters: Plugin.ChapterItem[] }
+        | { sig: string; chapters: Plugin.ChapterItem[]; probed?: boolean }
         | undefined;
       if (cached && typeof cached.sig === 'string' && Array.isArray(cached.chapters)) {
         return cached;
@@ -484,6 +585,16 @@ class NovelArchivePlugin implements Plugin.PluginBase {
     return dropped > 0 && dropped / sigN > NovelArchivePlugin.MAX_PLAUSIBLE_DROP_RATIO;
   }
 
+  // True when chapters are collapsed into one mega row per volume. In that
+  // shape an empty chapter is skipped at READ time (the concatenation drops
+  // 404s and keeps the servers' own numbering), so an up-front probe of every
+  // chapter buys nothing while costing ~20 requests per volume — ~340 for a
+  // 17-volume series in one open. That burst is what tripped the site's rate
+  // limiter and made volumes open empty.
+  private megaMode(): boolean {
+    return Boolean(storage.get('mergeVolumesToMega'));
+  }
+
   // Availability scan with persistence: when the raw chapter set is unchanged
   // since the last successful scan, reuse it; otherwise scan and persist.
   private async probeWithCache(
@@ -492,7 +603,9 @@ class NovelArchivePlugin implements Plugin.PluginBase {
   ): Promise<Plugin.ChapterItem[]> {
     const sig = this.probeSignature(raw);
     const cached = this.readProbeStore(volumeId);
-    if (cached && !this.storeLooksPoisoned(cached)) {
+    // Only a SCANNED entry may short-circuit the scan. A raw mega-mode entry
+    // (probed: false) is served by the read path, never as verified data.
+    if (cached && cached.probed === true && !this.storeLooksPoisoned(cached)) {
       if (cached.sig === sig) {
         volumeChapterCache.set(volumeId, cached.chapters);
         return cached.chapters;
@@ -557,7 +670,9 @@ class NovelArchivePlugin implements Plugin.PluginBase {
           throw new Error(`volume ${volumeId}: degraded response`);
         }
         const chapters = this.toChapters(volumeId, novel);
-        const probed = await this.probeWithCache(volumeId, chapters);
+        const probed = this.megaMode()
+          ? chapters
+          : await this.probeWithCache(volumeId, chapters);
         // Prefix each chapter's display name with its volume number so a merged
         // multi-volume list reads as one continuous series instead of seventeen
         // identical "Chapter 1" rows. The path (volumeId/origNumber) is left
@@ -571,6 +686,9 @@ class NovelArchivePlugin implements Plugin.PluginBase {
         }
         // Persist the FINAL (renamed) list under the raw signature so the
         // stale-serve path and the sig-hit path both return display-ready rows.
+        // `probed` records whether this entry is a SCANNED list or merely the
+        // raw one (mega mode skips the scan), so probeWithCache never serves
+        // an unscanned entry as if it were verified.
         volumeChapterCache.set(volumeId, probed);
         try {
           // Never overwrite a longer good scan with a degraded shorter one —
@@ -581,6 +699,7 @@ class NovelArchivePlugin implements Plugin.PluginBase {
             storage.set(`naprobe:${volumeId}`, {
               sig: this.probeSignature(chapters),
               chapters: probed,
+              probed: !this.megaMode(),
             });
           }
         } catch {
@@ -623,39 +742,18 @@ class NovelArchivePlugin implements Plugin.PluginBase {
     novelId: string,
     chapterNumber: number,
   ): Promise<boolean> {
-    try {
-      // Use fetchApi directly (not apiGet) so we can inspect the HTTP status.
-      // A confirmed non-OK (e.g. 404) means the chapter is genuinely absent ->
-      // drop it. Any *network* error (timeout, Cloudflare blip, offline) is
-      // UNVERIFIABLE, so we return "keep" — a flaky connection must never wipe
-      // the whole list. (Previously a thrown error returned false, which made
-      // a single bad probe drop the chapter; on a rate-limited/Cloudflare
-      // device enough probes failed that the merged+mega list collapsed to 0.)
-      const resp = await fetchApi(
-        `${this.site}/api/novels/${encodeURIComponent(
-          novelId,
-        )}/chapters/${encodeURIComponent(String(chapterNumber))}`,
-        {
-          headers: {
-            Accept: 'application/json',
-            'User-Agent':
-              'LNReader/2.1.0 (plugin: novelarchive; +https://github.com/5ghzx/novelarchive-lnreader)',
-          },
-        },
-      );
-      // Drop ONLY on a confirmed 404/410 (chapter genuinely absent — the API
-      // answers real "Chapter does not exist" cases with exactly this). Any
-      // other outcome is UNVERIFIABLE and keeps the chapter: 429/5xx (rate
-      // limiting), network errors, and DEGRADED 200s. That last one was the
-      // on-device "170 of 321 chapters / no Volume 1" bug — under load the
-      // API returns 200 bodies with no chapter payload, and treating those
-      // as confirmed absence mass-deleted chapters and whole volumes.
-      if (resp.status === 404 || resp.status === 410) return false;
-      return true;
-    } catch {
-      // Network error / unverifiable -> keep the chapter.
-      return true;
-    }
+    // A CONFIRMED 404/410 means the chapter is genuinely absent -> drop it.
+    // Anything else — a 429 rate limit, a 5xx, a degraded 200, a network
+    // error — is UNVERIFIABLE, so we keep the chapter. (Previously a thrown
+    // error returned false, which made a single bad probe drop the chapter;
+    // on a rate-limited device enough probes failed that whole volumes
+    // collapsed.)
+    const result = await this.fetchPaced(
+      `${this.site}/api/novels/${encodeURIComponent(
+        novelId,
+      )}/chapters/${encodeURIComponent(String(chapterNumber))}`,
+    );
+    return result.kind !== 'absent';
   }
 
   // Eager mode: probe every chapter in parallel (bounded by
@@ -789,26 +887,94 @@ class NovelArchivePlugin implements Plugin.PluginBase {
     volumeId: string,
     chapters: Plugin.ChapterItem[],
   ): Promise<string> {
-    // Fetch a volume's chapters with bounded parallelism (order preserved via
-    // the indexed results). Sequential fetching made opening a "(Full)" mega
-    // chapter wait on ~19 round-trips; 8-way cuts that to ~3 waves.
-    const tasks = chapters.map(ch => (async (): Promise<string | null> => {
+    // Each chapter is fetched through the global pacer, and the outcome is
+    // recorded three ways: content, a CONFIRMED absence (404/410 — the site's
+    // own "Chapter does not exist"), or a failure (throttled / degraded /
+    // transport). Only a confirmed absence may legitimately reduce a volume,
+    // so failures are retried in a rescue pass rather than dropped — that
+    // distinction is what fixes "Volume 2 → 0 readable content": previously
+    // every 429 was retried once after 400ms, counted as unreadable, and the
+    // volume collapsed.
+    const chapterUrl = (ch: Plugin.ChapterItem) => {
       const [, num] = ch.path.split('/');
+      return (
+        `${this.site}/api/novels/${encodeURIComponent(volumeId)}` +
+        `/chapters/${encodeURIComponent(String(num))}`
+      );
+    };
+    const fetchOne = async (
+      ch: Plugin.ChapterItem,
+      deadline: number,
+    ): Promise<{ html?: string; absent?: true; failed?: true }> => {
+      // Two attempts per chapter: the pacer already holds every caller for
+      // the server's Retry-After, so extra per-chapter retries mostly add lag
+      // to a reader waiting on the page. The rescue pass below is the second
+      // line of defence, and it is deadline-bounded.
+      const result = await this.fetchPaced(chapterUrl(ch), 2, deadline);
+      if (result.kind === 'absent') return { absent: true };
+      if (result.kind === 'unavailable') return { failed: true };
       try {
-        const resp = await this.apiGet<ChapterResponse>(
-          `/api/novels/${encodeURIComponent(volumeId)}/chapters/${encodeURIComponent(
-            String(num),
-          )}`,
-        );
-        const content = resp.chapter?.content;
-        if (!content) return null;
-        return `<h2>${ch.name}</h2>\n${this.toChapterHtml(content)}`;
+        const payload = (await result.response.json()) as ChapterResponse;
+        const content = payload.chapter?.content;
+        // A degraded 200 with no body is NOT an absence — it is the site
+        // shedding load, so it must be retried, never silently skipped.
+        if (!content) return { failed: true };
+        return { html: `<h2>${ch.name}</h2>\n${this.toChapterHtml(content)}` };
       } catch {
-        return null; // late 404 / blip — already excluded by the eager scan
+        return { failed: true };
       }
-    })());
-    const parts = await this.runWithConcurrency(tasks, 8);
-    return parts.filter((p): p is string => p !== null).join('\n<hr/>\n');
+    };
+
+    // A volume read gets one patience budget for all of its passes: pass 1
+    // gets a slice, the rescue pass whatever remains. Without this, a device
+    // the site is refusing outright would sit through every Retry-After of
+    // every chapter (~58s measured) and trip the reader's own timeout.
+    const deadline = Date.now() + VOLUME_READ_BUDGET_MS;
+    const firstPassDeadline = Math.min(
+      deadline,
+      Date.now() + VOLUME_FIRST_PASS_MS,
+    );
+    const outcomes = await this.runWithConcurrency(
+      chapters.map(ch => fetchOne(ch, firstPassDeadline)),
+      6,
+    );
+
+    // Rescue pass: only the chapters that FAILED for a reason other than
+    // confirmed absence. The gate held every request for the server's
+    // Retry-After, so by now the rate-limit window has drained. Skipped when
+    // the reader has already waited most of its patience — a slow page is not
+    // worth a timeout error, and whatever came back is served instead.
+    const retryIndexes = outcomes
+      .map((o, i) => (o && o.failed ? i : -1))
+      .filter(i => i >= 0);
+    if (retryIndexes.length && Date.now() < deadline) {
+      const retried = await this.runWithConcurrency(
+        retryIndexes.map(i => fetchOne(chapters[i], deadline)),
+        3,
+      );
+      retryIndexes.forEach((chapterIndex, slot) => {
+        const outcome = retried[slot];
+        if (outcome && outcome.html) outcomes[chapterIndex] = outcome;
+      });
+    }
+
+    const html = outcomes
+      .filter((o): o is { html: string } => Boolean(o && o.html))
+      .map(o => o.html)
+      .join('\n<hr/>\n');
+    if (html) {
+      // Partial (a chapter genuinely 404'd) is far better than an error page.
+      return html;
+    }
+    const absent = outcomes.filter(o => o && o.absent).length;
+    if (absent === chapters.length) {
+      throw new Error(
+        'NovelArchive has no readable chapters stored for this volume.',
+      );
+    }
+    throw new Error(
+      'NovelArchive is rate-limiting this device (HTTP 429) — wait about a minute, then reopen the volume.',
+    );
   }
 
   // Resolve a stable mega path ("volumeId/M/V<vol>") to its chapter list at
@@ -823,30 +989,34 @@ class NovelArchivePlugin implements Plugin.PluginBase {
     volumeId: string,
     vol: string,
   ): Promise<Plugin.ChapterItem[]> {
-    const response = await this.apiGet<NovelResponse>(
-      `/api/novels/${encodeURIComponent(volumeId)}`,
-    );
-    const chapters = this.toChapters(volumeId, response?.novel ?? {});
+    let chapters: Plugin.ChapterItem[] = [];
+    try {
+      const response = await this.apiGet<NovelResponse>(
+        `/api/novels/${encodeURIComponent(volumeId)}`,
+      );
+      chapters = this.toChapters(volumeId, response?.novel ?? {});
+    } catch {
+      /* degraded detail fetch — fall back to the persisted scan below */
+    }
+    if (!chapters.length) {
+      // The last good scan of this volume (written by parseNovel) keeps the
+      // mega chapter readable when the live detail fetch degrades.
+      chapters = this.readProbeStore(volumeId)?.chapters ?? [];
+    }
     if (!chapters.length) {
       throw new Error(`NovelArchive volume not found: ${volumeId}`);
     }
-    const tasks = chapters.map(async ch => {
-      const num = ch.path.split('/')[1];
-      const available = await this.probeChapterAvailable(
-        volumeId,
-        Number(num),
-      );
-      return available ? ch : null;
-    });
-    const settled = await this.runWithConcurrency(
-      tasks,
-      NovelArchivePlugin.SKIP_CONCURRENCY,
-    );
-    const kept = settled.filter((c): c is Plugin.ChapterItem => c !== null);
-    return kept.map((ch, n) => ({
+    // NO availability probing here. The reader is about to fetch every
+    // chapter's content anyway, and fetchAndConcatVolumeChapters already skips
+    // chapters that are genuinely absent. Probing first doubled the request
+    // count AND turned one degraded burst into "no readable content" for the
+    // whole volume (the field report for Volume 2), so the numbers stay the
+    // site's own: a skipped chapter leaves its number missing, never shifted.
+    return chapters.map(ch => ({
       ...ch,
-      chapterNumber: n + 1,
-      name: `Volume ${vol} Chapter ${n + 1}`,
+      name: /^volume\s+\d+/i.test(ch.name)
+        ? ch.name
+        : `Volume ${vol} ${ch.name}`,
     }));
   }
   // Run async tasks with a bounded concurrency limit, preserving input order.
@@ -996,26 +1166,92 @@ class NovelArchivePlugin implements Plugin.PluginBase {
     )}&chapter=${encodeURIComponent(chapterNumber)}`;
   };
 
-  private async apiGet<T>(path: string): Promise<T> {
-    const response = await fetchApi(`${this.site}${path}`, {
-      headers: {
-        Accept: 'application/json',
-        Referer: this.site,
-        // Honest client identity. The app injects a WebView Chrome UA by
-        // default; a browser-claiming UA over the app's non-browser TLS stack
-        // is exactly the fingerprint mismatch that got lnori.com's zone (and
-        // r.jina.ai) to mistreat the app's requests, and is the prime
-        // suspect for NA's edge degrading bursts on-device only.
-        'User-Agent':
-          'LNReader/2.1.0 (plugin: novelarchive; +https://github.com/5ghzx/novelarchive-lnreader)',
-      },
-    });
+  // Shared request headers. Honest client identity: the app injects a WebView
+  // Chrome UA by default, and a browser-claiming UA over the app's
+  // non-browser TLS stack is exactly the fingerprint mismatch that got
+  // lnori.com's zone (and r.jina.ai) to mistreat the app's requests, and is
+  // the prime suspect for NA's edge degrading bursts on-device only.
+  private apiHeaders() {
+    return {
+      Accept: 'application/json',
+      Referer: this.site,
+      'User-Agent':
+        'LNReader/2.1.0 (plugin: novelarchive; +https://github.com/5ghzx/novelarchive-lnreader)',
+    };
+  }
 
-    if ('ok' in response && !response.ok) {
-      throw new Error(`NovelArchive request failed: ${path}`);
+  // Milliseconds the server asked us to wait, from its own Retry-After
+  // header (Cloudflare sends `retry-after: 10` here). Falls back to the
+  // observed window; capped so a hostile value can't hang the reader.
+  private retryAfterMs(response: PacedResponse): number {
+    try {
+      const raw = response?.headers?.get?.('retry-after');
+      const seconds = Number.parseInt(String(raw ?? ''), 10);
+      if (Number.isFinite(seconds) && seconds > 0) {
+        return Math.min(seconds * 1000, 60000);
+      }
+    } catch {
+      /* no header access on this fetch wrapper */
+    }
+    return GATE_DEFAULT_RETRY_AFTER_MS;
+  }
+
+  // The ONLY way this plugin talks to the site. Every request goes through the
+  // global gate, and a rate-limited or broken response is retried (honoring
+  // the server's Retry-After) rather than being mistaken for data — a 429 is
+  // the site saying "later", never "this chapter doesn't exist".
+  private async fetchPaced(
+    url: string,
+    attempts = 3,
+    deadline = Number.POSITIVE_INFINITY,
+  ): Promise<PacedResult> {
+    for (let attempt = 1; attempt <= attempts; attempt++) {
+      if (Date.now() >= deadline) return { kind: 'unavailable' };
+      await requestGate.acquire();
+      // The gate may have parked us behind a Retry-After that outlasts this
+      // request's deadline — bail out instead of starting a doomed fetch.
+      if (Date.now() >= deadline) return { kind: 'unavailable' };
+      try {
+        const response = (await fetchApi(url, {
+          headers: this.apiHeaders(),
+        })) as PacedResponse;
+        const status = Number(response?.status ?? 0);
+        if (status === 404 || status === 410) {
+          return { kind: 'absent' };
+        }
+        if (RATE_LIMIT_STATUSES.has(status)) {
+          requestGate.penalize(this.retryAfterMs(response));
+          continue;
+        }
+        if ('ok' in response && !response.ok) {
+          throw new Error(`HTTP ${status}`);
+        }
+        requestGate.reward();
+        return { kind: 'ok', response };
+      } catch {
+        if (attempt === attempts) return { kind: 'unavailable' };
+        // Transport failure: brief bespoke pause, then the gate re-schedules.
+        requestGate.penalize(300 * attempt);
+        await new Promise(resolve => setTimeout(resolve, 200 * attempt));
+      }
+    }
+    return { kind: 'unavailable' };
+  }
+
+  private async apiGet<T>(path: string, attempts = 3): Promise<T> {
+    const result = await this.fetchPaced(`${this.site}${path}`, attempts);
+
+    if (result.kind !== 'ok') {
+      // Never silently accept a failed call as "empty": callers distinguish
+      // degradation (keep what we have, retry) from real absence.
+      throw new Error(
+        result.kind === 'absent'
+          ? `NovelArchive not found: ${path}`
+          : `NovelArchive request failed: ${path}`,
+      );
     }
 
-    return response.json();
+    return (await result.response.json()) as T;
   }
 
   private getPopularEndpoint(
