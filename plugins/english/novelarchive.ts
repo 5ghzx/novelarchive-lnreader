@@ -136,6 +136,20 @@ const volumeSigMemo = new Map<string, string>();
 // partial read must stay re-fetchable. Empty string = known-oversize.
 const volumeHtmlCache = new Map<string, string>();
 const VOLUME_HTML_CACHE_MAX_BYTES = 3_000_000;
+// Entry cap: 6 complete volume reads ≈ 18 MB worst case (3 MB cap each),
+// typically well under 2 MB total. Without a cap a long reading session
+// grows the cache without bound on low-RAM e-ink devices.
+const VOLUME_HTML_CACHE_MAX_ENTRIES = 6;
+// Insertion-ordered Map: re-setting an entry refreshes its recency and the
+// oldest entry is evicted once the cap is hit.
+function cacheVolumeHtml(volumeId: string, html: string): void {
+  volumeHtmlCache.delete(volumeId);
+  if (volumeHtmlCache.size >= VOLUME_HTML_CACHE_MAX_ENTRIES) {
+    const oldest = volumeHtmlCache.keys().next().value;
+    if (oldest !== undefined) volumeHtmlCache.delete(oldest);
+  }
+  volumeHtmlCache.set(volumeId, html);
+}
 // Volume ids kept alive by their cached copy during the CURRENT parse
 // (cleared at the start of each merge) — powers the "served from cache"
 // banner note.
@@ -236,7 +250,7 @@ class NovelArchivePlugin implements Plugin.PluginBase {
   // nameless source rows (localeCompare crash) were born. Keep in lockstep
   // with the manifest entry build-dist.mjs generates.
   name = 'Novel Archive';
-  version = '1.1.50';
+  version = '1.1.51';
   icon = 'src/en/novelarchive/icon.png';
   site = 'https://novelarchive.cc';
   lang = 'English';
@@ -362,11 +376,10 @@ class NovelArchivePlugin implements Plugin.PluginBase {
       `/api/novels/${encodeURIComponent(id)}`,
     );
     const source = response.novel;
-    this.lastSourceTitle = source.title || '';
-
     if (!source) {
       throw new Error(`NovelArchive novel not found: ${id}`);
     }
+    this.lastSourceTitle = source.title || '';
 
     const author = this.cleanText(source.author);
     const novel: Plugin.SourceNovel = {
@@ -459,7 +472,10 @@ class NovelArchivePlugin implements Plugin.PluginBase {
         staleVolumes.clear();
         const fetchVolumes = (list: string[]) =>
           this.runWithConcurrency(
-            list.map(async vid => {
+            // LAZY factories: eager `map(async ...)` starts every fetch at
+            // creation and pre-books its pacer slot, so VOLUME_CONCURRENCY
+            // bounded nothing and in-flight volume fetches grew unbounded.
+            list.map(vid => async () => {
               try {
                 return {
                   ok: true as const,
@@ -661,8 +677,23 @@ class NovelArchivePlugin implements Plugin.PluginBase {
     const scanned = await this.filterUnavailableChapters(raw);
     volumeChapterCache.set(volumeId, scanned);
     volumeSigMemo.set(volumeId, sig);
-    // NOTE: persistence happens ONLY with display-ready (renamed) lists in
-    // getVolumeChapters, so a sig-hit can never return an intermediate form.
+    // Persist the scan so the NEXT refresh sig-hits instead of re-probing.
+    // Persistence used to live only in getVolumeChapters (merge path), so a
+    // single-volume parse re-probed ~20 chapters on EVERY refresh. The merge
+    // path later rewrites this entry display-ready (renamed) in
+    // getVolumeChapters, so a sig-hit can never serve an intermediate form.
+    try {
+      const prev = this.readProbeStore(volumeId);
+      if (!prev || this.sigCount(prev.sig) <= raw.length) {
+        storage.set(`naprobe:${volumeId}`, {
+          sig,
+          chapters: scanned,
+          probed: true,
+        });
+      }
+    } catch {
+      /* caching is best-effort */
+    }
     return scanned;
   }
 
@@ -794,12 +825,23 @@ class NovelArchivePlugin implements Plugin.PluginBase {
   ): Promise<Plugin.ChapterItem[]> {
     if (!chapters.length) return chapters;
     // Only drop when both the scan AND a re-probe agree the chapter is gone.
-    const tasks = chapters.map(async ch => {
-      const [novelId, num] = ch.path.split('/');
-      const available = await this.probeChapterAvailable(novelId, Number(num));
-      // Unverifiable (network error) -> keep, don't drop.
-      return available ? ch : { ch, dropped: true as const };
-    });
+    // LAZY factories: eager `map(async ...)` starts every probe immediately
+    // and pre-books its pacer slot, so SKIP_CONCURRENCY bounded nothing but
+    // the gate gap, and in-flight probes grew unbounded on slow responses.
+    const tasks = chapters.map(
+      ch =>
+        async (): Promise<
+          Plugin.ChapterItem | { ch: Plugin.ChapterItem; dropped: true }
+        > => {
+          const [novelId, num] = ch.path.split('/');
+          const available = await this.probeChapterAvailable(
+            novelId,
+            Number(num),
+          );
+          // Unverifiable (network error) -> keep, don't drop.
+          return available ? ch : { ch, dropped: true as const };
+        },
+    );
     const settled = await this.runWithConcurrency(
       tasks,
       NovelArchivePlugin.SKIP_CONCURRENCY,
@@ -814,14 +856,17 @@ class NovelArchivePlugin implements Plugin.PluginBase {
           s !== null && 'dropped' in s,
       )
       .map(s => s.ch);
-    const reprobeTasks = firstPassDropped.map(async ch => {
-      const [novelId, num] = ch.path.split('/');
-      const stillGone = !(await this.probeChapterAvailable(
-        novelId,
-        Number(num),
-      ));
-      return stillGone ? ch : null; // recovered on re-probe -> keep
-    });
+    const reprobeTasks = firstPassDropped.map(
+      ch =>
+        async (): Promise<Plugin.ChapterItem | null> => {
+          const [novelId, num] = ch.path.split('/');
+          const stillGone = !(await this.probeChapterAvailable(
+            novelId,
+            Number(num),
+          ));
+          return stillGone ? ch : null; // recovered on re-probe -> keep
+        },
+    );
     const confirmedDropped = (
       await this.runWithConcurrency(reprobeTasks, 2)
     ).filter((c): c is Plugin.ChapterItem => c !== null);
@@ -871,13 +916,13 @@ class NovelArchivePlugin implements Plugin.PluginBase {
     // Group by volume number from display name; fall back to the source
     // novel's own volume number when chapters aren't prefixed (single-volume
     // path with merge off).
+    const sourceVol = this.volumeNumber(this.lastSourceTitle);
     const byVolume = new Map<string, Plugin.ChapterItem[]>();
     for (const ch of chapters) {
       const match = ch.name.match(/Volume\s+(\d+)/i);
       let vol = match ? match[1] : '0';
       if (vol === '0') {
-        const v = this.volumeNumber(this.lastSourceTitle);
-        vol = v > 0 ? String(v) : '1';
+        vol = sourceVol > 0 ? String(sourceVol) : '1';
       }
       if (!byVolume.has(vol)) byVolume.set(vol, []);
       byVolume.get(vol)!.push(ch);
@@ -1010,7 +1055,7 @@ class NovelArchivePlugin implements Plugin.PluginBase {
       // the whole paced crawl. Only "failed" slots (throttled/degraded) keep
       // a volume uncached so a re-open retries them.
       if (outcomes.every(o => o && (o.html || o.absent))) {
-        volumeHtmlCache.set(
+        cacheVolumeHtml(
           volumeId,
           html.length <= VOLUME_HTML_CACHE_MAX_BYTES ? html : '',
         );
@@ -1134,6 +1179,10 @@ class NovelArchivePlugin implements Plugin.PluginBase {
     const stableMega = chapterPath.match(/^(.+)\/M\/V(\d+)$/);
     if (stableMega) {
       const [, volumeId, vol] = stableMega;
+      // Session cache hit serves WITHOUT the volume-detail round-trip that
+      // fetchVolumeChapterList would pay first.
+      const cachedHtml = volumeHtmlCache.get(volumeId);
+      if (cachedHtml) return cachedHtml;
       const chapters = await this.fetchVolumeChapterList(volumeId, vol);
       return this.fetchAndConcatVolumeChapters(volumeId, chapters);
     }
@@ -1152,8 +1201,6 @@ class NovelArchivePlugin implements Plugin.PluginBase {
         }));
       return this.fetchAndConcatVolumeChapters(volumeId, chapters);
     }
-    const [pathWithoutAnchor, anchor] = chapterPath.split('#');
-    const url = this.site.replace(/\/$/, '') + '/' + pathWithoutAnchor;
     const { novelId, chapterNumber } = this.parseChapterPath(chapterPath);
     const response = await this.apiGet<ChapterResponse>(
       `/api/novels/${encodeURIComponent(novelId)}/chapters/${encodeURIComponent(
@@ -1228,7 +1275,15 @@ class NovelArchivePlugin implements Plugin.PluginBase {
   }
 
   resolveUrl = (path: string, isNovel?: boolean) => {
-
+    // Share links. Mega rows ("volumeId/M/V<n>") and novel paths carry no
+    // single chapter number, and parseChapterPath THROWS on both — so the
+    // share action silently failed for every mega-mode chapter and novel.
+    // The reader route without a chapter param opens the volume/book.
+    const mega = path.match(/^(.+)\/M\/V\d+$/);
+    if (mega || isNovel || !path.includes('/')) {
+      const novelId = this.extractNovelId(mega ? mega[1] : path);
+      return `${this.site}/reader?novel=${encodeURIComponent(novelId)}`;
+    }
     const { novelId, chapterNumber } = this.parseChapterPath(path);
     return `${this.site}/reader?novel=${encodeURIComponent(
       novelId,

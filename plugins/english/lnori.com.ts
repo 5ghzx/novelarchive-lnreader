@@ -21,7 +21,7 @@ class LnoriComPlugin implements Plugin.PluginBase {
   // Required by the app's PluginItem: the UPDATE path copies name/site/lang
   // from this evaluated module back into the stored plugin row.
   lang = 'English';
-  version = '1.0.23';
+  version = '1.0.24';
   pluginSettings = {
     mergeCoverTitle: {
       label: 'Merge cover + title page into one entry',
@@ -45,7 +45,6 @@ class LnoriComPlugin implements Plugin.PluginBase {
   // which is where the old module-level cache died and re-downloaded the
   // 1.8 MB library every session) and served stale whenever the site
   // misbehaves.
-  private static readonly FETCH_TIMEOUT_MS = 60000;
   private static readonly LIBRARY_TTL_MS = 7 * 24 * 3600 * 1000;
   private static readonly SERIES_TTL_MS = 12 * 3600 * 1000;
   private static readonly VOLUME_TTL_MS = 24 * 3600 * 1000;
@@ -100,6 +99,28 @@ class LnoriComPlugin implements Plugin.PluginBase {
   // under it ourselves so a first full-series parse (N volume pages) can't
   // trip 429s — self-throttle to 18/min.
   private static readonly RELAY_MAX_PER_MIN = 18;
+  // MS the relay asked us to wait (its own retry-after / x-ratelimit-reset),
+  // with the observed free-tier window as fallback — same contract as the
+  // site-side pacing: the proxy's word beats a guess, capped against a
+  // hostile value.
+  private static readonly RELAY_DEFAULT_RETRY_AFTER_MS = 15000;
+
+  private relayRetryAfterMs(res: {
+    headers?: { get?: (name: string) => string | null };
+  }): number {
+    try {
+      for (const name of ['retry-after', 'x-ratelimit-reset']) {
+        const raw = res?.headers?.get?.(name);
+        const seconds = Number.parseInt(String(raw ?? ''), 10);
+        if (Number.isFinite(seconds) && seconds > 0) {
+          return Math.min(seconds * 1000, 60000);
+        }
+      }
+    } catch {
+      /* no header access on this fetch wrapper */
+    }
+    return LnoriComPlugin.RELAY_DEFAULT_RETRY_AFTER_MS;
+  }
   // Once a direct fetch exhibits the tarpit signature (timeout or bot-check
   // shell), skip the direct path entirely for a while: otherwise every page
   // of a multi-volume parse would burn its full direct window before
@@ -126,22 +147,28 @@ class LnoriComPlugin implements Plugin.PluginBase {
     // x-return-format: html — without it the relay returns markdown text.
     // fetchApi applies the app's default headers; nothing about the device
     // leaks beyond what a normal page view would send.
-    await this.throttleRelay();
     const relayInit = {
       headers: {
         'x-return-format': 'html',
         'User-Agent': LnoriComPlugin.PLUGIN_UA,
       },
     };
-    const res = await fetchApi(LnoriComPlugin.RELAY_PREFIX + url, relayInit);
+    const fetchOnce = () =>
+      fetchApi(LnoriComPlugin.RELAY_PREFIX + url, relayInit) as Promise<{
+        ok: boolean;
+        status: number;
+        headers?: { get?: (name: string) => string | null };
+        text: () => Promise<string>;
+      }>;
+    const res = await fetchOnce();
     if (res.status === 429) {
-      // Shared free tier can still 429 under us — one polite retry after a
-      // short wait instead of failing the page.
-      await new Promise(r => setTimeout(r, 15000));
-      const retry = await fetchApi(
-        LnoriComPlugin.RELAY_PREFIX + url,
-        relayInit,
-      );
+      // Shared free tier can still 429 under us — wait out the relay's own
+      // window (not a guess), refuel our local budget to match, and retry
+      // once instead of failing the page.
+      const waitMs = this.relayRetryAfterMs(res);
+      LnoriComPlugin.relayLog.length = 0;
+      await new Promise(r => setTimeout(r, waitMs));
+      const retry = await fetchOnce();
       if (!retry.ok) throw new Error(`relay HTTP ${retry.status}`);
       return retry.text();
     }
@@ -248,7 +275,23 @@ class LnoriComPlugin implements Plugin.PluginBase {
     return this.loadLibrary(false);
   }
 
+  // Single-flight: Browse, Search and the stale-cache background refresh all
+  // funnel through here. Without the shared promise, two callers racing on a
+  // cold/expired cache each download the full 1.8 MB library page — double
+  // spend against the relay's 20/min budget precisely when the site is
+  // tarpitting and every request is relay-routed.
+  private libraryInflight: Promise<LibraryEntry[]> | null = null;
+
   private async loadLibrary(force = false): Promise<LibraryEntry[]> {
+    if (!force && libraryCache) return libraryCache.items;
+    if (this.libraryInflight) return this.libraryInflight;
+    this.libraryInflight = this.doLoadLibrary(force).finally(() => {
+      this.libraryInflight = null;
+    });
+    return this.libraryInflight;
+  }
+
+  private async doLoadLibrary(force = false): Promise<LibraryEntry[]> {
     if (!force && libraryCache) return libraryCache.items;
     const LIBRARY_KEY = 'library';
     if (!force) {
