@@ -21,12 +21,17 @@ class LnoriComPlugin implements Plugin.PluginBase {
   // Required by the app's PluginItem: the UPDATE path copies name/site/lang
   // from this evaluated module back into the stored plugin row.
   lang = 'English';
-  version = '1.0.24';
+  version = '1.0.25';
   pluginSettings = {
-    mergeCoverTitle: {
-      label: 'Merge cover + title page into one entry',
-      type: 'Switch',
-      value: true,
+    mergeMode: {
+      label: 'Merge entries',
+      type: 'Select',
+      value: 'matter',
+      options: [
+        { label: 'No merge', value: 'none' },
+        { label: 'Merge cover & title pages', value: 'matter' },
+        { label: 'Merge volumes (one entry per volume)', value: 'volumes' },
+      ],
     },
     relayFallback: {
       label: 'Fallback fetch via browser-render relay (fixes timeouts)',
@@ -70,6 +75,14 @@ class LnoriComPlugin implements Plugin.PluginBase {
     } catch {
       /* caching is best-effort */
     }
+  }
+
+  // 'matter' is the historical default; installs predating the dropdown
+  // stored the old boolean switch, migrate it instead of resetting them.
+  private mergeMode(): 'none' | 'matter' | 'volumes' {
+    const v = storage.get('mergeMode');
+    if (v === 'none' || v === 'matter' || v === 'volumes') return v;
+    return storage.get('mergeCoverTitle') === false ? 'none' : 'matter';
   }
 
   // Every real lnori page carries at least one of these markers (library →
@@ -446,17 +459,23 @@ class LnoriComPlugin implements Plugin.PluginBase {
       }
     });
 
+    // Volume display label: the site's link text is unreliable — volume 1
+    // says "Start Reading" and the rest just "Volume N" — so derive a clean
+    // "Volume N" from the text when it carries one, else from the page slug
+    // (…-vol-03). Series without numbered volumes keep their own label.
     const getVolumeName = (href: string, text: string) => {
-      let cleanText = text.replace(/Start Reading/gi, '').trim();
-      if (!cleanText) {
-        const parts = href.split('/');
-        const slug = parts[parts.length - 1] || parts[parts.length - 2] || '';
-        cleanText = slug
-          .split('-')
-          .map(word => word.charAt(0).toUpperCase() + word.slice(1))
-          .join(' ');
-      }
-      return cleanText;
+      const cleanText = text.replace(/Start Reading/gi, '').trim();
+      let m = cleanText.match(/\b(?:volume|vol\.?)\s*(\d+(?:\.\d+)?)/i);
+      if (m) return `Volume ${String(Number(m[1]))}`;
+      m = href.match(/vol[-_.]?(\d+(?:\.\d+)?)/i);
+      if (m) return `Volume ${String(Number(m[1]))}`;
+      if (cleanText) return cleanText;
+      const parts = href.split('/');
+      const slug = parts[parts.length - 1] || parts[parts.length - 2] || '';
+      return slug
+        .split('-')
+        .map(word => word.charAt(0).toUpperCase() + word.slice(1))
+        .join(' ');
     };
 
     const volumeUrls = Object.keys(volumeMap);
@@ -558,7 +577,17 @@ class LnoriComPlugin implements Plugin.PluginBase {
     }
     let chapters: Plugin.ChapterItem[] = results.map(r => r ?? []).flat();
 
-    // Toggle (default on): fold front/back-matter pages into one entry PER
+    // "Merge volumes" mode: collapse each volume to ONE row, like Novel
+    // Archive's merged volumes. Reading it renders the volume's whole TOC in
+    // order (the '#mega' branch in parseChapter).
+    if (this.mergeMode() === 'volumes') {
+      chapters = volumeUrls.map(volUrl => ({
+        name: `${getVolumeName(volUrl, volumeMap[volUrl])} (Full)`,
+        path: volUrl.replace(/^\//, '') + '#mega',
+      }));
+    }
+
+    // Mode 'matter': fold front/back-matter pages into one entry PER
     // VOLUME. Real series data (e.g. lnori Konosuba, 17 volumes) shows every
     // volume carries its own Cover / Insert(s) / Title Page cluster — often
     // with "Insert" pages BETWEEN Cover and Title Page — so:
@@ -568,7 +597,7 @@ class LnoriComPlugin implements Plugin.PluginBase {
     //   3. label the merged row from its actual contents with the volume
     //      prefix kept ("Vol 2 - Cover & Insert & Title Page") so the N groups
     //      in a multi-volume series stay distinguishable.
-    if (storage.get('mergeCoverTitle') ?? true) {
+    if (this.mergeMode() === 'matter') {
       // Plural-tolerant: real TOCs use "Color Illustrations", "Inserts", etc.
       const MATTER_RE =
         /(character\s+galler(?:y|ies)|covers?|inserts?|illustrations?|color\s+illustrations?|title\s*pages?|prolog(?:ue|s)?|prolog|colophons?|copyrights?|front\s*matters?|back\s*matters?|table\s+of\s+contents?)\s*$/i;
@@ -705,6 +734,36 @@ class LnoriComPlugin implements Plugin.PluginBase {
       }
       return pagesContent.join('\n');
     };
+
+    // Merged-volume entry ("#mega"): render the volume's whole TOC in order,
+    // each part headed by its own title, so one row reads like a book.
+    if (anchorRaw === 'mega') {
+      if (tocAnchors.length) {
+        const parts: string[] = [];
+        for (const a of tocAnchors) {
+          const html = renderAnchorRange(a);
+          if (!html) continue;
+          const title = $(
+            `nav.toc-view a[href="#${a}"], nav#toc-list a[href="#${a}"]`,
+          )
+            .first()
+            .text()
+            .trim()
+            .replace(/\s+/g, ' ');
+          parts.push(title ? `<h3>${title}</h3>\n${html}` : html);
+        }
+        return parts.join('\n');
+      }
+      // Fallback page shape (no TOC nav): render every chapter section.
+      const ids: string[] = [];
+      $('section.chapter').each((i, el) => {
+        const id = $(el).attr('id');
+        if (id) ids.push(id);
+      });
+      return (ids.length ? ids.map(a => renderAnchorRange(a)) : [renderAnchorRange('')])
+        .filter(Boolean)
+        .join('\n');
+    }
 
     // Multi-anchor (merged matter rows): render each anchor's full range.
     if (anchors.length > 1) {
