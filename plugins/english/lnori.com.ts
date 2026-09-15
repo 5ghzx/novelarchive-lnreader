@@ -21,7 +21,7 @@ class LnoriComPlugin implements Plugin.PluginBase {
   // Required by the app's PluginItem: the UPDATE path copies name/site/lang
   // from this evaluated module back into the stored plugin row.
   lang = 'English';
-  version = '1.0.25';
+  version = '1.0.26';
   pluginSettings = {
     mergeMode: {
       label: 'Merge entries',
@@ -534,7 +534,10 @@ class LnoriComPlugin implements Plugin.PluginBase {
     let cursor = 0;
     const loadVolume = async (idx: number): Promise<void> => {
       const volUrl = volumeUrls[idx];
-      const volKey = 'vol' + volUrl;
+      // 'v2': parsed chapter NAMES are derived data — when the naming logic
+      // changed (1.0.25 "Volume N" labels), old parsed lists had to be
+      // dropped, not served.
+      const volKey = 'vol2:' + volUrl;
       const fullVolUrl = this.site.replace(/\/$/, '') + volUrl;
       const cachedVol = this.cacheGet<Plugin.ChapterItem[]>(
         volKey,
