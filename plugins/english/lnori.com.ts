@@ -21,7 +21,7 @@ class LnoriComPlugin implements Plugin.PluginBase {
   // Required by the app's PluginItem: the UPDATE path copies name/site/lang
   // from this evaluated module back into the stored plugin row.
   lang = 'English';
-  version = '1.0.26';
+  version = '1.0.27';
   pluginSettings = {
     mergeMode: {
       label: 'Merge entries',
@@ -393,6 +393,39 @@ class LnoriComPlugin implements Plugin.PluginBase {
     return filteredList.slice(offset, offset + pageSize).map(item => item.novel);
   }
 
+  // TOC source for a book page, best first: (1) the site's side nav, (2) the
+  // ebook's own embedded TOC (sgc-toc section, anchor links into the page's
+  // sections). Some books (e.g. Demon Lord, Retry!) ship an EMPTY side nav
+  // (<ul></ul>) with only the embedded TOC populated — without the fallback
+  // those books fell back to one row per <section>, which mislabels
+  // title-splash sections as chapters and serves their 30-char heading
+  // instead of the chapter's prose.
+  private effectiveToc($vol: CheerioAPI): { id: string; title: string }[] {
+    const toc: { id: string; title: string }[] = [];
+    const seen = new Set<string>();
+    const push = (id: string, title: string) => {
+      if (!id || seen.has(id)) return;
+      seen.add(id);
+      toc.push({ id, title });
+    };
+    $vol('nav.toc-view a[href^="#"], nav#toc-list a[href^="#"]').each((i, el) => {
+      const href = $vol(el).attr('href');
+      if (href) push(href.substring(1), $vol(el).text().trim().replace(/\s+/g, ' '));
+    });
+    if (toc.length === 0) {
+      $vol('section.chapter a[href^="#"]').each((i, el) => {
+        // Only trust anchors inside an embedded TOC block (sgc-toc-*), not
+        // arbitrary in-prose links.
+        const block = $vol(el).closest('[class*="sgc-toc"]');
+        if (!block.length) return;
+        const href = $vol(el).attr('href');
+        const title = $vol(el).text().trim().replace(/\s+/g, ' ');
+        if (href) push(href.substring(1), title);
+      });
+    }
+    return toc;
+  }
+
   async parseNovel(novelPath: string): Promise<Plugin.SourceNovel> {
     const url = this.site + novelPath;
     // Series page: persistent cache (12h) with stale-serve + quiet background
@@ -461,14 +494,18 @@ class LnoriComPlugin implements Plugin.PluginBase {
 
     // Volume display label: the site's link text is unreliable — volume 1
     // says "Start Reading" and the rest just "Volume N" — so derive a clean
-    // "Volume N" from the text when it carries one, else from the page slug
-    // (…-vol-03). Series without numbered volumes keep their own label.
+    // "Volume N". The URL slug is canonical (the site's own book pages title
+    // e.g. "Vol. 04.5" while its series-page link text says just "Volume 4",
+    // which made Volume 4.5 render as a second "Volume 4"), and the slug can
+    // carry a fractional part (…-vol-04-5). Link text is the fallback for
+    // links without a vol slug. Series without numbered volumes keep their
+    // own label.
     const getVolumeName = (href: string, text: string) => {
       const cleanText = text.replace(/Start Reading/gi, '').trim();
-      let m = cleanText.match(/\b(?:volume|vol\.?)\s*(\d+(?:\.\d+)?)/i);
-      if (m) return `Volume ${String(Number(m[1]))}`;
-      m = href.match(/vol[-_.]?(\d+(?:\.\d+)?)/i);
-      if (m) return `Volume ${String(Number(m[1]))}`;
+      const slugM = href.match(/vol[-_.](\d+(?:[.-]\d+)?)/i);
+      if (slugM) return `Volume ${Number(slugM[1].replace('-', '.'))}`;
+      const m = cleanText.match(/\b(?:volume|vol\.?)\s*(\d+(?:\.\d+)?)/i);
+      if (m) return `Volume ${Number(m[1])}`;
       if (cleanText) return cleanText;
       const parts = href.split('/');
       const slug = parts[parts.length - 1] || parts[parts.length - 2] || '';
@@ -491,22 +528,18 @@ class LnoriComPlugin implements Plugin.PluginBase {
     // Per-volume page -> chapter list (pure parse, no I/O).
     const parseVolume = ($vol: CheerioAPI, volUrl: string): Plugin.ChapterItem[] => {
       const volChapters: Plugin.ChapterItem[] = [];
-      const tocLinks = $vol('nav.toc-view a[href^="#"], nav#toc-list a[href^="#"]');
+      const toc = this.effectiveToc($vol);
 
-      if (tocLinks.length > 0) {
-        tocLinks.each((i, el) => {
-          const href = $vol(el).attr('href');
-          if (!href) return;
-          const id = href.substring(1);
-          const tocTitle = $vol(el).text().trim().replace(/\s+/g, ' ');
+      if (toc.length > 0) {
+        for (const { id, title } of toc) {
           const section = $vol(`section#${id}`);
           const h2Title = section.find('h2.chapter-title, h2, h3').first().text().trim();
-          const chapterName = tocTitle || h2Title || `Page ${id.replace(/\D/g, '')}`;
+          const chapterName = title || h2Title || `Page ${id.replace(/\D/g, '')}`;
           const volTitle = getVolumeName(volUrl, volumeMap[volUrl]);
           let path = volUrl;
           if (path.startsWith('/')) path = path.substring(1);
           volChapters.push({ name: `${volTitle} - ${chapterName}`, path: path + '#' + id });
-        });
+        }
       } else {
         $vol('section.chapter').each((i, el) => {
           const id = $vol(el).attr('id');
@@ -534,10 +567,10 @@ class LnoriComPlugin implements Plugin.PluginBase {
     let cursor = 0;
     const loadVolume = async (idx: number): Promise<void> => {
       const volUrl = volumeUrls[idx];
-      // 'v2': parsed chapter NAMES are derived data — when the naming logic
-      // changed (1.0.25 "Volume N" labels), old parsed lists had to be
-      // dropped, not served.
-      const volKey = 'vol2:' + volUrl;
+      // 'v3': parsed chapter NAMES are derived data — when the naming logic
+      // changed (1.0.25 "Volume N" labels, 1.0.27 slug-first "Volume 4.5"),
+      // old parsed lists had to be dropped, not served.
+      const volKey = 'vol3:' + volUrl;
       const fullVolUrl = this.site.replace(/\/$/, '') + volUrl;
       const cachedVol = this.cacheGet<Plugin.ChapterItem[]>(
         volKey,
@@ -678,10 +711,7 @@ class LnoriComPlugin implements Plugin.PluginBase {
     const $ = parseHTML(body);
 
     const tocAnchors: string[] = [];
-    $('nav.toc-view a[href^="#"], nav#toc-list a[href^="#"]').each((i, el) => {
-      const href = $(el).attr('href');
-      if (href) tocAnchors.push(href.substring(1));
-    });
+    for (const { id } of this.effectiveToc($)) tocAnchors.push(id);
 
     // Render one TOC anchor: the section itself PLUS every following
     // sibling <section class="chapter"> up to (not including) the next
@@ -753,7 +783,15 @@ class LnoriComPlugin implements Plugin.PluginBase {
             .text()
             .trim()
             .replace(/\s+/g, ' ');
-          parts.push(title ? `<h3>${title}</h3>\n${html}` : html);
+          const fallbackTitle = $(`section#${a}`)
+            .find('h2.chapter-title, h2, h3')
+            .first()
+            .text()
+            .trim()
+            .replace(/\s+/g, ' ');
+          parts.push(
+            title || fallbackTitle ? `<h3>${title || fallbackTitle}</h3>\n${html}` : html,
+          );
         }
         return parts.join('\n');
       }
