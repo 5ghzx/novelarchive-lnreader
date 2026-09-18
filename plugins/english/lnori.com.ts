@@ -21,7 +21,7 @@ class LnoriComPlugin implements Plugin.PluginBase {
   // Required by the app's PluginItem: the UPDATE path copies name/site/lang
   // from this evaluated module back into the stored plugin row.
   lang = 'English';
-  version = '1.0.30';
+  version = '1.0.32';
   pluginSettings = {
     mergeMode: {
       label: 'Merge entries',
@@ -509,7 +509,7 @@ class LnoriComPlugin implements Plugin.PluginBase {
     // carry a fractional part (…-vol-04-5). Link text is the fallback for
     // links without a vol slug. Series without numbered volumes keep their
     // own label.
-    const getVolumeName = (href: string, text: string) => {
+    const baseVolumeName = (href: string, text: string) => {
       const cleanText = text.replace(/Start Reading/gi, '').trim();
       // Multi-era series (Classroom of the Elite lists its Year 1/2/3 books
       // on one series page) reuse the same vol-N tail in every slug, so the
@@ -522,8 +522,34 @@ class LnoriComPlugin implements Plugin.PluginBase {
       const era = eraM
         ? `${eraM[1].charAt(0).toUpperCase()}${eraM[1].slice(1)} ${eraM[2]} `
         : '';
-      const slugM = href.match(/vol[-_.](\d+(?:[.-]\d+)?)/i);
-      if (slugM) return `${era}Volume ${Number(slugM[1].replace('-', '.'))}`;
+      // Fractional volumes are spelled with a single fractional digit in
+      // slugs (…-vol-04-5 → 4.5, …-volume-08-5 → 8.5). A multi-digit tail is a
+      // subtitle, not a fraction: …-vol-7-110-million-bride is Volume 7 ("110
+      // Million Bride"), and the old [.-]\d+ tail turned it into "Volume
+      // 7.11". Both "vol-N" and "volume-N" spellings occur site-wide.
+      // Sub-series books (86 EIGHTY-SIX Alter, Index SS, Silent Witch Another,
+      // Infinite Dendrogram SP, Durarara SH, Explosion bonus stories) carry a
+      // marker segment right before the vol token in the slug while the site's
+      // link text still just says "Volume 1" — dropping the marker collides
+      // those labels with the main series' volumes (the same class of bug as
+      // the COTE eras).
+      const subM = href.match(
+        /[-_](alter|another|ss|sp|sh|extra|gaiden|side|spinoff|special|short|bonus-story|bonus)[-_]vol(?:ume)?[-_.](\d+)(?:[.-](\d)(?!\d))?/i,
+      );
+      const volNum = (n1: string, frac?: string) =>
+        frac ? `${Number(n1)}.${frac}` : Number(n1);
+      if (subM) {
+        const marker =
+          subM[1].length <= 2
+            ? subM[1].toUpperCase()
+            : subM[1]
+                .split('-')
+                .map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase())
+                .join(' ');
+        return `${era}${marker} Volume ${volNum(subM[2], subM[3])}`;
+      }
+      const slugM = href.match(/vol(?:ume)?[-_.](\d+)(?:[.-](\d)(?!\d))?/i);
+      if (slugM) return `${era}Volume ${volNum(slugM[1], slugM[2])}`;
       const m = cleanText.match(/\b(?:volume|vol\.?)\s*(\d+(?:\.\d+)?)/i);
       if (m) return `${era}Volume ${Number(m[1])}`;
       if (cleanText) return cleanText;
@@ -534,6 +560,43 @@ class LnoriComPlugin implements Plugin.PluginBase {
         .map(word => word.charAt(0).toUpperCase() + word.slice(1))
         .join(' ');
     };
+    // Some volumes ship as separate books sharing one number (…-volume-4-canto-i
+    // /-canto-ii, …-volume-10-act-1 /-act-2, …-volume-7-exordium /-finale):
+    // identical base labels would collide in the chapter list (and mega mode),
+    // so a catalog-wide scan feeds every colliding group a slug qualifier
+    // ("· Canto II", "· Exordium"). Books whose slug carries no qualifier get
+    // an ordinal "· Part N" (rare; the site once mashed a sequel series onto
+    // one page, where labels are at least kept distinct).
+    const dupSuffix: Record<string, string> = (() => {
+      const groups: Record<string, string[]> = {};
+      for (const [href, text] of Object.entries(volumeMap))
+        (groups[baseVolumeName(href, text)] ||= []).push(href);
+      const suffix: Record<string, string> = {};
+      for (const hrefs of Object.values(groups)) {
+        if (hrefs.length < 2) continue;
+        hrefs.forEach((href, i) => {
+          // Qualifier = the slug's trailing non-numeric segments after the
+          // volume number (…-volume-4-canto-ii → "Canto II"); roman-numeral
+          // fragments stay uppercase.
+          const segs = (href.split('/').pop() || '').split('-');
+          const tail: string[] = [];
+          for (let j = segs.length - 1; j >= 0 && !/\d/.test(segs[j]); j--)
+            tail.unshift(segs[j]);
+          suffix[href] = tail.length
+            ? ` · ${tail
+                .map(w =>
+                  /^[ivxlcdm]+$/.test(w)
+                    ? w.toUpperCase()
+                    : w.charAt(0).toUpperCase() + w.slice(1),
+                )
+                .join(' ')}`
+            : ` · Part ${i + 1}`;
+        });
+      }
+      return suffix;
+    })();
+    const getVolumeName = (href: string, text: string) =>
+      `${baseVolumeName(href, text)}${dupSuffix[href] || ''}`;
 
     const volumeUrls = Object.keys(volumeMap);
     // A linkless series page means the fetch got something other than the real
@@ -592,7 +655,7 @@ class LnoriComPlugin implements Plugin.PluginBase {
       // 1.0.29 era prefixes for multi-year series, 1.0.30 splash-strip so
       // "Start Reading" can't win the label vote), old parsed lists had to
       // be dropped, not served.
-      const volKey = 'vol6:' + volUrl;
+      const volKey = 'vol8:' + volUrl;
       const fullVolUrl = this.site.replace(/\/$/, '') + volUrl;
       const cachedVol = this.cacheGet<Plugin.ChapterItem[]>(
         volKey,
