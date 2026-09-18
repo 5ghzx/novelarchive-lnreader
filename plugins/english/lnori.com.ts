@@ -21,7 +21,7 @@ class LnoriComPlugin implements Plugin.PluginBase {
   // Required by the app's PluginItem: the UPDATE path copies name/site/lang
   // from this evaluated module back into the stored plugin row.
   lang = 'English';
-  version = '1.0.32';
+  version = '1.0.33';
   pluginSettings = {
     mergeMode: {
       label: 'Merge entries',
@@ -62,7 +62,7 @@ class LnoriComPlugin implements Plugin.PluginBase {
   private cacheGet<T>(key: string, ttlMs: number): { data: T; stale: boolean } | null {
     try {
       const hit = storage.get(key) as { v: T; at: number } | undefined;
-      if (!hit || typeof hit.at !== 'number' || hit.v == null) return null;
+      if (!hit || typeof hit.at !== 'number' || hit.v == null || hit.v === '') return null;
       return { data: hit.v, stale: Date.now() - hit.at > ttlMs };
     } catch {
       return null; // corrupted entry — treat as missing
@@ -74,6 +74,17 @@ class LnoriComPlugin implements Plugin.PluginBase {
       storage.set(key, { v: data, at: Date.now() });
     } catch {
       /* caching is best-effort */
+    }
+  }
+
+  // Empty-string tombstone: cacheGet treats '' values as absent, so this
+  // reliably hides a poisoned entry without depending on storage delete
+  // semantics (no real cached value is ever '').
+  private cacheDelete(key: string): void {
+    try {
+      storage.set(key, { v: '', at: Date.now() });
+    } catch {
+      /* best-effort */
     }
   }
 
@@ -776,24 +787,56 @@ class LnoriComPlugin implements Plugin.PluginBase {
   }
 
   async parseChapter(chapterPath: string): Promise<string> {
-    const [pathWithoutAnchor, anchorRaw] = chapterPath.split('#');
-    // A merged "Cover & Title Page" entry carries two anchors joined by comma
-    // ("page01,page02"); render each section and concatenate.
-    const anchors = (anchorRaw || '').split(',').filter(Boolean);
+    const [pathWithoutAnchor] = chapterPath.split('#');
     const url = this.site.replace(/\/$/, '') + '/' + pathWithoutAnchor;
     // Chapter pages never change once published: cache for 30 days so
     // re-reading (and tarpit windows) never touches the network. Cap stored
     // size to keep MMKV lean.
     const chapKey = 'chap' + chapterPath;
-    let body: string;
     const cachedChap = this.cacheGet<string>(chapKey, LnoriComPlugin.CHAPTER_TTL_MS);
-    if (cachedChap) {
-      body = cachedChap.data;
-    } else {
-      body = await this.fetchPage(url);
-      if (body.length < 800000) this.cacheSet(chapKey, body);
+    const body = cachedChap ? cachedChap.data : await this.fetchPage(url);
+    let html: string;
+    try {
+      html = this.renderChapterBody(chapterPath, parseHTML(body));
+    } catch (e) {
+      // Any extraction failure on a CACHED body evicts it (poisoned raw page
+      // — e.g. a rate-limited render missing the target section), so the
+      // next read refetches instead of serving the same brick for 30 days.
+      if (cachedChap) this.cacheDelete(chapKey);
+      throw e;
     }
-    const $ = parseHTML(body);
+    // Cache only after extraction PROVED the page carried this chapter's
+    // content; a failed extraction never poisons the cache.
+    if (!cachedChap && body.length < 800000) this.cacheSet(chapKey, body);
+    return html;
+  }
+
+  // Extraction shared by every entry shape (mega / multi-anchor / single).
+  // Throws (which makes the caller evict any cached raw body) when the page
+  // renders nothing readable, so the next read refetches instead of serving
+  // a 30-day-cached empty chapter.
+  private renderChapterBody(chapterPath: string, $: CheerioAPI): string {
+    const anchors = (chapterPath.split('#')[1] || '').split(',').filter(Boolean);
+    const html = this.renderChapterBodyParts(chapterPath, anchors, $);
+    const textish = html
+      .replace(/<[^>]*>/g, ' ')
+      .replace(/&[a-z#0-9]+;/gi, ' ')
+      .trim();
+    if (!textish && !/<img[^>]+src=/i.test(html)) {
+      throw new Error(
+        `LNORI.com: chapter page rendered no readable content: ${chapterPath}`,
+      );
+    }
+    return html;
+  }
+
+  private renderChapterBodyParts(
+    chapterPath: string,
+    anchors: string[],
+    $: CheerioAPI,
+  ): string {
+    // A merged "Cover & Title Page" entry carries two anchors joined by comma
+    // ("page01,page02"); render each section and concatenate.
 
     // Prefer the section's `.main` body, but only when it actually carries
     // content — some pages (Hero-Killing Bride v3 bonus short story) ship an
@@ -856,7 +899,7 @@ class LnoriComPlugin implements Plugin.PluginBase {
 
     // Merged-volume entry ("#mega"): render the volume's whole TOC in order,
     // each part headed by its own title, so one row reads like a book.
-    if (anchorRaw === 'mega') {
+    if (anchors[0] === 'mega') {
       if (tocAnchors.length) {
         const parts: string[] = [];
         for (const a of tocAnchors) {
