@@ -21,7 +21,7 @@ class LnoriComPlugin implements Plugin.PluginBase {
   // Required by the app's PluginItem: the UPDATE path copies name/site/lang
   // from this evaluated module back into the stored plugin row.
   lang = 'English';
-  version = '1.0.28';
+  version = '1.0.30';
   pluginSettings = {
     mergeMode: {
       label: 'Merge entries',
@@ -484,9 +484,18 @@ class LnoriComPlugin implements Plugin.PluginBase {
     const volumeMap: Record<string, string> = {};
     $('a[href^="/book/"]').each((i, el) => {
       const href = $(el).attr('href');
-      const text = $(el).text().trim().replace(/\s+/g, ' ');
-      if (href) {
-        if (!volumeMap[href] || (text && text.length > volumeMap[href].length)) {
+      // Strip the "Start Reading" splash BEFORE the longest-text comparison:
+      // it's the longest label on every series page yet never the volume's
+      // real name (Succubus/Seventh rendered as "<Series Title> Volume 1"
+      // slug-titlecase because the splash out-lengthed "Volume 1").
+      const text = $(el)
+        .text()
+        .trim()
+        .replace(/\s+/g, ' ')
+        .replace(/Start Reading/gi, '')
+        .trim();
+      if (href && text) {
+        if (!volumeMap[href] || text.length > volumeMap[href].length) {
           volumeMap[href] = text;
         }
       }
@@ -502,10 +511,21 @@ class LnoriComPlugin implements Plugin.PluginBase {
     // own label.
     const getVolumeName = (href: string, text: string) => {
       const cleanText = text.replace(/Start Reading/gi, '').trim();
+      // Multi-era series (Classroom of the Elite lists its Year 1/2/3 books
+      // on one series page) reuse the same vol-N tail in every slug, so the
+      // era prefix (…-year-2-vol-1) must survive into the label — otherwise
+      // "Volume 1" maps to three different books. Year-1-era books carry no
+      // marker in the slug and stay unprefixed, matching how they publish.
+      const eraM =
+        href.match(/(?:^|[-_/])(year|season|part|arc)[-_/](\d+)(?=[-_]|$)/i) ||
+        cleanText.match(/\b(year|season|part|arc)\s+(\d+)\b/i);
+      const era = eraM
+        ? `${eraM[1].charAt(0).toUpperCase()}${eraM[1].slice(1)} ${eraM[2]} `
+        : '';
       const slugM = href.match(/vol[-_.](\d+(?:[.-]\d+)?)/i);
-      if (slugM) return `Volume ${Number(slugM[1].replace('-', '.'))}`;
+      if (slugM) return `${era}Volume ${Number(slugM[1].replace('-', '.'))}`;
       const m = cleanText.match(/\b(?:volume|vol\.?)\s*(\d+(?:\.\d+)?)/i);
-      if (m) return `Volume ${Number(m[1])}`;
+      if (m) return `${era}Volume ${Number(m[1])}`;
       if (cleanText) return cleanText;
       const parts = href.split('/');
       const slug = parts[parts.length - 1] || parts[parts.length - 2] || '';
@@ -567,10 +587,12 @@ class LnoriComPlugin implements Plugin.PluginBase {
     let cursor = 0;
     const loadVolume = async (idx: number): Promise<void> => {
       const volUrl = volumeUrls[idx];
-      // 'v3': parsed chapter NAMES are derived data — when the naming logic
-      // changed (1.0.25 "Volume N" labels, 1.0.27 slug-first "Volume 4.5"),
-      // old parsed lists had to be dropped, not served.
-      const volKey = 'vol4:' + volUrl;
+      // Parsed chapter NAMES are derived data — when the naming logic
+      // changed (1.0.25 "Volume N" labels, 1.0.27 slug-first "Volume 4.5",
+      // 1.0.29 era prefixes for multi-year series, 1.0.30 splash-strip so
+      // "Start Reading" can't win the label vote), old parsed lists had to
+      // be dropped, not served.
+      const volKey = 'vol6:' + volUrl;
       const fullVolUrl = this.site.replace(/\/$/, '') + volUrl;
       const cachedVol = this.cacheGet<Plugin.ChapterItem[]>(
         volKey,
@@ -710,6 +732,29 @@ class LnoriComPlugin implements Plugin.PluginBase {
     }
     const $ = parseHTML(body);
 
+    // Prefer the section's `.main` body, but only when it actually carries
+    // content — some pages (Hero-Killing Bride v3 bonus short story) ship an
+    // EMPTY <div class="main"> with the real prose as direct section
+    // children, which a blind `.main` preference silently swallowed to 0
+    // characters of readable text.
+    const sectionContent = (sec: ReturnType<CheerioAPI>) => {
+      const main = sec.find('.main');
+      const mc =
+        main.length && (main.text().trim() || main.find('img').length)
+          ? main.clone()
+          : sec.clone();
+      mc.find('h2, h3, .chapter-title').remove();
+      mc.find('img').each((i, el) => {
+        const src = $(el).attr('src');
+        if (src && src.startsWith('/')) $(el).attr('src', this.site.replace(/\/$/, '') + src);
+      });
+      mc.find('source').each((i, el) => {
+        const srcset = $(el).attr('srcset');
+        if (srcset && srcset.startsWith('/')) $(el).attr('srcset', this.site.replace(/\/$/, '') + srcset);
+      });
+      return mc.html() || '';
+    };
+
     const tocAnchors: string[] = [];
     for (const { id } of this.effectiveToc($)) tocAnchors.push(id);
 
@@ -728,34 +773,12 @@ class LnoriComPlugin implements Plugin.PluginBase {
         // Anchor not in TOC (or no TOC): fall back to just that section.
         const sec = anchor ? $(`section#${anchor}`) : $('section.chapter').first();
         if (!sec.length) return '';
-        const mc = sec.find('.main').length ? sec.find('.main').clone() : sec.clone();
-        mc.find('h2, h3, .chapter-title').remove();
-        mc.find('img').each((i, el) => {
-          const src = $(el).attr('src');
-          if (src && src.startsWith('/')) $(el).attr('src', this.site.replace(/\/$/, '') + src);
-        });
-        mc.find('source').each((i, el) => {
-          const srcset = $(el).attr('srcset');
-          if (srcset && srcset.startsWith('/')) $(el).attr('srcset', this.site.replace(/\/$/, '') + srcset);
-        });
-        return mc.html() || '';
+        return sectionContent(sec);
       }
       const pagesContent: string[] = [];
       let stepSection = $(`section#${anchor}`);
       while (stepSection.length) {
-        const mc = stepSection.find('.main').length
-          ? stepSection.find('.main').clone()
-          : stepSection.clone();
-        mc.find('h2, h3, .chapter-title').remove();
-        mc.find('img').each((i, el) => {
-          const src = $(el).attr('src');
-          if (src && src.startsWith('/')) $(el).attr('src', this.site.replace(/\/$/, '') + src);
-        });
-        mc.find('source').each((i, el) => {
-          const srcset = $(el).attr('srcset');
-          if (srcset && srcset.startsWith('/')) $(el).attr('srcset', this.site.replace(/\/$/, '') + srcset);
-        });
-        const html = mc.html();
+        const html = sectionContent(stepSection);
         if (html) pagesContent.push(html);
 
         let nextSibling = stepSection.next();
@@ -822,23 +845,7 @@ class LnoriComPlugin implements Plugin.PluginBase {
       return renderAnchorRange(anchor);
     }
 
-    const mainContent = section.find('.main').length
-      ? section.find('.main').clone()
-      : section.clone();
-    mainContent.find('h2, h3, .chapter-title').remove();
-    mainContent.find('img').each((i, el) => {
-      const src = $(el).attr('src');
-      if (src && src.startsWith('/')) {
-        $(el).attr('src', this.site.replace(/\/$/, '') + src);
-      }
-    });
-    mainContent.find('source').each((i, el) => {
-      const srcset = $(el).attr('srcset');
-      if (srcset && srcset.startsWith('/')) {
-        $(el).attr('srcset', this.site.replace(/\/$/, '') + srcset);
-      }
-    });
-    return mainContent.html() || '';
+    return sectionContent(section);
   }
 
   async searchNovels(searchTerm: string, pageNo: number): Promise<Plugin.NovelItem[]> {
